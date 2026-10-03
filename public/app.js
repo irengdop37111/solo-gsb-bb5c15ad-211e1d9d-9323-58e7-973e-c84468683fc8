@@ -8,6 +8,20 @@ const connEl = document.getElementById('conn');
 const TYPE_TEXT = { light: '灯光', sound: '音效', set: '布景', other: '其他' };
 const STATUS_TEXT = { pending: '待执行', fired: '已触发', skipped: '已跳过', blocked: '受阻' };
 const REQUEST_STATUS_TEXT = { pending: '待复核', confirmed: '已确认', cancelled: '已撤销', rejected: '已驳回' };
+// 节奏分类（仅设置了计划的提示；计时起点为原演出启动时间，接续演出回溯最初演出）
+const RHYTHM_TEXT = { early: '提前', ontime: '准时', late: '逾时', skipped: '跳过', overdue: '逾时待执行', pending: '待执行' };
+// 偏差秒数格式化：正=晚、负=早，保留到 0.1 秒显示
+function fmtDeviation(sec) {
+  if (sec == null) return '';
+  const n = Math.round(sec * 10) / 10;
+  return (n > 0 ? '晚 ' : n < 0 ? '早 ' : '') + Math.abs(n) + ' 秒';
+}
+// 节奏徽章 HTML
+function rhythmBadge(rh) {
+  if (!rh) return '';
+  const dev = rh.deviation_seconds == null ? '' : `（${fmtDeviation(rh.deviation_seconds)}）`;
+  return `<span class="status rhythm-${rh.status}" title="计划 ${rh.planned_seconds} 秒 ± ${rh.tolerance_seconds} 秒，相对原演出开演">⏱ ${esc(rh.status_text || RHYTHM_TEXT[rh.status] || rh.status)}${esc(dev)}</span>`;
+}
 
 let toastTimer = null;
 let pollTimer = null;
@@ -230,6 +244,8 @@ function collectEditorCues() {
     deps: c.depsText.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean),
     needs_review: !!c.needs_review,
     needs_prep: !!c.needs_prep,
+    planned_seconds: c.planText == null ? '' : String(c.planText).trim(),
+    tolerance_seconds: c.tolText == null ? '' : String(c.tolText).trim(),
   }));
 }
 
@@ -249,6 +265,8 @@ function renderEditorTable() {
       <td><input type="text" class="deps-input" data-i="${i}" data-f="depsText" value="${esc(c.depsText)}" placeholder="前置编号，逗号分隔"></td>
       <td style="text-align:center"><input type="checkbox" data-i="${i}" data-f="needs_review" ${c.needs_review ? 'checked' : ''} title="现场触发需另一操作人复核确认"></td>
       <td style="text-align:center"><input type="checkbox" data-i="${i}" data-f="needs_prep" ${c.needs_prep ? 'checked' : ''} title="现场触发前需舞台监督发预备口令、另一操作人确认就绪"></td>
+      <td title="相对开演的计划秒数（非负整数，按提示顺序不递减；留空=不设置计划，发布后锁定）"><input type="number" min="0" step="1" class="plan-input" data-i="${i}" data-f="planText" value="${esc(c.planText)}" placeholder="留空"></td>
+      <td title="容许偏差秒数（非负整数；设置计划后留空默认 0；触发落在计划±容差内算准时）"><input type="number" min="0" step="1" class="tol-input" data-i="${i}" data-f="tolText" value="${esc(c.tolText)}" placeholder="0"></td>
       <td style="white-space:nowrap">
         <button class="ghost small" data-act="up" data-i="${i}" ${i === 0 ? 'disabled' : ''}>↑</button>
         <button class="ghost small" data-act="down" data-i="${i}" ${i === editorCues.length - 1 ? 'disabled' : ''}>↓</button>
@@ -299,7 +317,7 @@ async function renderVersion(id) {
         <p class="muted">发布于 ${fmtTime(version.published_at)}　${esc(version.note || '')}</p>
         <div class="panel">
           <table>
-            <thead><tr><th>#</th><th>编号</th><th>类型</th><th>描述</th><th>前置提示</th><th>复核</th><th>预备</th></tr></thead>
+            <thead><tr><th>#</th><th>编号</th><th>类型</th><th>描述</th><th>前置提示</th><th>复核</th><th>预备</th><th>计划 / 容差（秒）</th></tr></thead>
             <tbody>
               ${cues.map(c => `
                 <tr>
@@ -310,6 +328,7 @@ async function renderVersion(id) {
                   <td>${c.deps.length ? c.deps.map(d => `<span class="dep-chip">${esc(d)}</span>`).join('') : '<span class="muted">无</span>'}</td>
                   <td>${c.needs_review ? '<span class="badge review">双人复核</span>' : '<span class="muted">—</span>'}</td>
                   <td>${c.needs_prep ? '<span class="badge prep-badge">需预备</span>' : '<span class="muted">—</span>'}</td>
+                  <td>${c.planned_seconds == null ? '<span class="muted">未设置计划</span>' : `<b>${c.planned_seconds}</b> <span class="muted">±${c.tolerance_seconds || 0}</span>`}</td>
                 </tr>`).join('')}
             </tbody>
           </table>
@@ -335,14 +354,16 @@ async function renderVersion(id) {
       label: c.label, type: c.type, description: c.description, depsText: c.deps.join(', '),
       needs_review: !!c.needs_review,
       needs_prep: !!c.needs_prep,
+      planText: c.planned_seconds == null ? '' : String(c.planned_seconds),
+      tolText: c.tolerance_seconds == null ? '' : String(c.tolerance_seconds),
     }));
 
     app.innerHTML = `
       <h1>执行单 v${version.version_number} <span class="badge draft">草稿</span></h1>
-      <p class="muted">前置提示填写其他提示的编号（逗号分隔）。勾选「复核」的提示现场触发时需另一操作人确认；勾选「预备」的提示现场须先发预备口令、由另一操作人确认就绪后才可触发（标记均随发布锁定，旧版按无需处理）。保存不影响已开始的演出。</p>
+      <p class="muted">前置提示填写其他提示的编号（逗号分隔）。勾选「复核」的提示现场触发时需另一操作人确认；勾选「预备」的提示现场须先发预备口令、由另一操作人确认就绪后才可触发（标记均随发布锁定，旧版按无需处理）。可在「计划秒数」填相对开演的计划秒数、「容差秒数」填容许偏差（均为非负整数，计划秒数按提示顺序不递减；留空=不设置计划，旧版未设置计划的提示不参与节奏统计）。保存不影响已开始的演出。</p>
       <div class="panel">
         <table class="editor-table">
-          <thead><tr><th>#</th><th>编号</th><th>类型</th><th>描述</th><th>前置提示</th><th>复核</th><th>预备</th><th>操作</th></tr></thead>
+          <thead><tr><th>#</th><th>编号</th><th>类型</th><th>描述</th><th>前置提示</th><th>复核</th><th>预备</th><th title="相对开演的计划秒数，留空=不设置计划">计划秒</th><th title="容许偏差秒数，设置计划后留空默认 0">容差秒</th><th>操作</th></tr></thead>
           <tbody id="editor-tbody"></tbody>
         </table>
         <div class="row" style="margin-top:12px">
@@ -360,7 +381,7 @@ async function renderVersion(id) {
     renderEditorTable();
 
     document.getElementById('add-cue').onclick = () => {
-      editorCues.push({ label: '', type: 'light', description: '', depsText: '' });
+      editorCues.push({ label: '', type: 'light', description: '', depsText: '', planText: '', tolText: '' });
       renderEditorTable();
     };
 
@@ -430,7 +451,7 @@ async function renderPerformance(id) {
   } catch (e) { app.innerHTML = `<div class="error-list">${esc(e.message)}</div>`; }
 }
 
-function drawPerformance(id, { performance: perf, continuation, continue_targets: targets, cues, events, review_requests: reviewRequests, faults, active_fault_count: activeFaultCount, prep_commands: prepCommands, active_prep_count: activePrepCount, handover, handover_history: handoverHistory, closing }) {
+function drawPerformance(id, { performance: perf, continuation, continue_targets: targets, cues, events, review_requests: reviewRequests, faults, active_fault_count: activeFaultCount, prep_commands: prepCommands, active_prep_count: activePrepCount, handover, handover_history: handoverHistory, closing, rhythm, rhythm_items: rhythmItems }) {
   // 2.5s 轮询整体重绘：记住当前焦点与光标位置，重绘后恢复，避免输入被打断
   const active = document.activeElement;
   const focusKey = active && (active.dataset.focusKey || (active.id === 'operator-input' ? 'operator' : null));
@@ -488,6 +509,15 @@ function drawPerformance(id, { performance: perf, continuation, continue_targets
         ${activeFaults.length ? `<span class="status fault-active">⚠ 故障 ${activeFaults.length} · 冻结 ${blockedByFaultSet.size}</span>` : ''}
         ${pendingPrepCount ? `<span class="status prep-pending-chip">预备待确认 ${pendingPrepCount}</span>` : ''}
         ${readyPrepCount ? `<span class="status prep-ready-chip">✓ 已就绪 ${readyPrepCount}</span>` : ''}
+        ${rhythm && rhythm.planned_count ? `
+          <span class="status rhythm-ontime">⏱ 准时 ${rhythm.ontime_count}</span>
+          <span class="status rhythm-early">提前 ${rhythm.early_count}</span>
+          <span class="status rhythm-late">逾时 ${rhythm.late_count}</span>
+          <span class="status rhythm-overdue">逾时待执行 ${rhythm.overdue_count}</span>
+          <span class="status rhythm-skipped">跳过(不计偏差) ${rhythm.skipped_count}</span>
+          ${rhythm.avg_deviation_seconds == null ? '' : `<span class="muted" title="仅统计已触发的有计划提示">平均偏差 ${fmtDeviation(rhythm.avg_deviation_seconds)}</span>`}
+          ${rhythm.on_time_rate == null ? '' : `<span class="muted" title="已触发的有计划提示中准时占比">准时率 ${Math.round(rhythm.on_time_rate * 100)}%</span>`}
+        ` : ''}
         ${handover ? `<span class="status handover-pending-chip">🔁 交接待签收 · ${esc(handover.received_by)}</span>` : ''}
         <span class="grow"></span>
         <label>操作人 <input id="operator-input" type="text" value="${esc(opVal)}" placeholder="姓名" style="width:110px" ${locked ? 'disabled' : ''}></label>
@@ -499,6 +529,7 @@ function drawPerformance(id, { performance: perf, continuation, continue_targets
     <div id="handover-panel-mount"></div>
     <div id="fault-panel-mount"></div>
     <div id="prep-panel-mount"></div>
+    <div id="rhythm-panel-mount"></div>
     ${locked ? '' : '<div id="continue-panel-mount"></div>'}
     <div id="closing-panel-mount"></div>
     <div class="grid-2">
@@ -560,6 +591,7 @@ function drawPerformance(id, { performance: perf, continuation, continue_targets
                 ${e.source === 'carried'
                   ? `<span class="badge carried" title="接续时自演出 #${esc(e.carried_from_performance_id)} 承接，非现场再次触发">承接自 #${esc(e.carried_from_performance_id)}</span>`
                   : ''}
+                ${e.rhythm ? rhythmBadge(e.rhythm) : (e.action === 'retracted' ? '<span class="muted" title="原触发已退出当前节奏统计">· 退出统计</span>' : '')}
                 <br>
                 <span class="muted">${esc(e.operator)} · ${fmtTime(e.created_at)}${e.reason ? '<br>原因：' + esc(e.reason) : ''}</span>
               </li>`).join('')}
@@ -574,6 +606,7 @@ function drawPerformance(id, { performance: perf, continuation, continue_targets
   // 只读（已接续）/ 已封场演出仍展示交接、故障、预备与封场报告（回看形态，无任何写操作表单）
   drawHandoverPanel(id, handover, handoverHistory || [], true);
   drawClosingPanel(id, closing, closed || readonly);
+  drawRhythmPanel(rhythm, rhythmItems || []);
   if (locked) {
     drawFaultPanel(id, cues, faultList, activeFaults, true);
     drawPrepPanel(id, cues, prepList, true);
@@ -613,6 +646,7 @@ function drawPerformance(id, { performance: perf, continuation, continue_targets
   drawBatchPanel(id, cues);
   drawFaultPanel(id, cues, faultList, activeFaults, readonly);
   drawPrepPanel(id, cues, prepList, false);
+  drawRhythmPanel(rhythm, rhythmItems || []);
   drawContinuePanel(id, targets || []);
   drawHandoverPanel(id, handover, handoverHistory || [], false);
   drawClosingPanel(id, closing, false);
@@ -1048,13 +1082,21 @@ function renderClosingReport(closing) {
         <span class="status skipped">已跳过 ${r.skipped_count}</span>
         <span>本场手写流水 ${r.manual_event_count}</span>
         <span>承接流水 ${r.carried_event_count}（非本场再次触发）</span>
+        ${r.rhythm && r.rhythm.summary && r.rhythm.summary.planned_count ? `
+          <span class="status rhythm-ontime">⏱ 准时 ${r.rhythm.summary.ontime_count}</span>
+          <span class="status rhythm-early">提前 ${r.rhythm.summary.early_count}</span>
+          <span class="status rhythm-late">逾时 ${r.rhythm.summary.late_count}</span>
+          <span class="status rhythm-skipped">跳过 ${r.rhythm.summary.skipped_count}</span>
+          <span class="muted">平均偏差 ${r.rhythm.summary.avg_deviation_seconds == null ? '—' : fmtDeviation(r.rhythm.summary.avg_deviation_seconds)}</span>
+          <span class="muted">准时率 ${r.rhythm.summary.on_time_rate == null ? '—' : Math.round(r.rhythm.summary.on_time_rate * 100) + '%'}</span>
+        ` : ''}
         ${r.performance && r.performance.continuation_from_performance_id
           ? `<span>承接自演出 #${r.performance.continuation_from_performance_id}</span>` : ''}
       </div>
       <details open class="handover-details" style="margin-top:8px">
         <summary class="muted">最终提示结果（${done.length}/${finals.length}；含原操作人、时间、流水与来源；承接结果可追溯原流水）</summary>
         <div class="hint-table-wrap"><table class="hint-table closing-final-table">
-          <thead><tr><th style="width:36px">#</th><th style="width:70px">编号</th><th style="width:70px">最终结果</th><th style="width:80px">来源</th><th>操作人 / 原操作人</th><th>时间</th><th>流水</th></tr></thead>
+          <thead><tr><th style="width:36px">#</th><th style="width:70px">编号</th><th style="width:70px">最终结果</th><th style="width:80px">来源</th><th>操作人 / 原操作人</th><th>时间</th><th style="width:150px">节奏（计划±容差）</th><th>流水</th></tr></thead>
           <tbody>
             ${finals.map(f => `
               <tr>
@@ -1071,6 +1113,12 @@ function renderClosingReport(closing) {
                     : ''}
                 </td>
                 <td class="muted">${fmtTime(f.created_at)}</td>
+                <td>
+                  ${f.planned_seconds == null
+                    ? '<span class="muted">未设置计划</span>'
+                    : `<div class="muted">${f.planned_seconds} ± ${f.tolerance_seconds || 0} 秒</div>
+                       ${f.rhythm_status ? rhythmBadge({ status: f.rhythm_status, status_text: f.rhythm_status_text, deviation_seconds: f.deviation_seconds, planned_seconds: f.planned_seconds, tolerance_seconds: f.tolerance_seconds }) : ''}`}
+                </td>
                 <td class="muted">
                   #${f.event_id}
                   ${f.source === 'carried' && f.origin_hops && f.origin_hops.length > 1
@@ -1079,7 +1127,7 @@ function renderClosingReport(closing) {
                     : ''}
                 </td>
               </tr>
-              ${f.reason ? `<tr class="closing-reason-row"><td></td><td></td><td colspan="5" class="muted">原因：${esc(f.reason)}</td></tr>` : ''}
+              ${f.reason ? `<tr class="closing-reason-row"><td></td><td></td><td colspan="6" class="muted">原因：${esc(f.reason)}</td></tr>` : ''}
             `).join('')}
           </tbody>
         </table></div>
@@ -1811,6 +1859,54 @@ function ACTION_TEXT(a) {
   return a === 'fired' ? '已触发' : a === 'skipped' ? '已跳过' : '已撤回';
 }
 
+/* ---------- 节奏统计面板（相对原演出开演；接续演出回溯最初演出） ---------- */
+function drawRhythmPanel(rhythm, items) {
+  const mount = document.getElementById('rhythm-panel-mount');
+  if (!mount) return;
+  if (!rhythm || !rhythm.planned_count) {
+    mount.innerHTML = '';
+    return;
+  }
+  const r = rhythm;
+  const rateTxt = r.on_time_rate == null ? '—' : (Math.round(r.on_time_rate * 100) + '%');
+  const avgTxt = r.avg_deviation_seconds == null ? '—' : fmtDeviation(r.avg_deviation_seconds);
+  mount.innerHTML = `
+    <div class="panel rhythm-panel">
+      <div class="row">
+        <b>⏱ 提示节奏统计（${r.planned_count} 条有计划提示）</b>
+        <span class="muted">计时起点为${items.length ? '' : ''}原演出开演 ${fmtTime(r.timing_origin)}（接续沿用该起点）；当前已过 ${Math.round(r.elapsed_seconds)} 秒</span>
+        <span class="grow"></span>
+      </div>
+      <div class="row" style="font-size:13px;margin-top:8px">
+        <span class="status rhythm-ontime">准时 ${r.ontime_count}</span>
+        <span class="status rhythm-early">提前 ${r.early_count}</span>
+        <span class="status rhythm-late">逾时 ${r.late_count}</span>
+        <span class="status rhythm-overdue">逾时待执行 ${r.overdue_count}</span>
+        <span class="status rhythm-pending">待执行 ${r.pending_count}</span>
+        <span class="status rhythm-skipped">跳过 ${r.skipped_count}（不计偏差）</span>
+        <span class="muted">准时率（按已触发）：${rateTxt}</span>
+        <span class="muted">平均偏差（仅已触发）：${avgTxt}</span>
+      </div>
+      <details style="margin-top:8px">
+        <summary class="muted">逐条节奏（计划 ± 容差 / 分类 / 偏差秒）</summary>
+        <div class="hint-table-wrap" style="margin-top:6px"><table class="hint-table">
+          <thead><tr><th style="width:36px">#</th><th style="width:70px">编号</th><th>计划（秒）</th><th>容差（秒）</th><th>分类</th><th>偏差秒</th></tr></thead>
+          <tbody>
+            ${items.map(it => `
+              <tr>
+                <td class="muted">${it.seq}</td>
+                <td><b>${esc(it.label)}</b></td>
+                <td>${it.planned_seconds}</td>
+                <td>${it.tolerance_seconds}</td>
+                <td>${rhythmBadge(it)}</td>
+                <td class="muted">${it.deviation_seconds == null ? '—' : it.deviation_seconds}</td>
+              </tr>`).join('')}
+          </tbody>
+        </table></div>
+      </details>
+    </div>`;
+}
+
 function cueCard(perfId, c, readonly) {
   const depsHtml = c.deps.length
     ? c.deps.map(d => `<span class="dep-chip ${c.unmet.includes(d) ? 'unmet-chip' : 'met'}">${esc(d)}</span>`).join('')
@@ -1852,6 +1948,10 @@ function cueCard(perfId, c, readonly) {
   const canIssuePrep = !readonly && c.needs_prep && !done;
   const fireLabel = c.needs_review ? '申请触发' : '触发';
   const prepLabel = prep ? '重新发口令' : '发预备口令';
+  // 节奏：设置了计划的提示展示计划/容差与当前分类（撤回后按未执行实时重判，跳过不计偏差）
+  const planHtml = c.planned_seconds == null ? '' : (
+    `<div class="cue-event"><span class="muted">⏱ 计划开演后 ${c.planned_seconds} 秒 ± ${c.tolerance_seconds || 0} 秒</span>${c.rhythm ? '　' + rhythmBadge(c.rhythm) : ''}</div>`
+  );
   return `
     <div class="cue-card ${c.status}${faultHit ? ' fault-hit' : ''}${c.needs_prep ? ' prep-cue' : ''}">
       <div class="cue-seq">${c.seq}</div>
@@ -1866,6 +1966,7 @@ function cueCard(perfId, c, readonly) {
           ${c.event && c.event.source === 'carried' ? '<span class="badge carried">承接</span>' : ''}
           ${ownFault ? '<span class="badge fault-badge">⚠ 设备故障</span>' : (faultHit ? '<span class="badge fault-affected-badge">触发冻结</span>' : '')}
           <span class="status ${c.status}">${STATUS_TEXT[c.status]}</span>
+          ${c.rhythm ? rhythmBadge(c.rhythm) : ''}
         </div>
         ${c.description ? `<div class="cue-desc">${esc(c.description)}</div>` : ''}
         <div class="cue-deps">前置：${depsHtml}</div>
@@ -1873,6 +1974,7 @@ function cueCard(perfId, c, readonly) {
         ${faultHtml}
         ${reviewHtml}
         ${prepHtml}
+        ${planHtml}
         ${eventHtml}
       </div>
       <div class="cue-actions">

@@ -13,9 +13,17 @@
  *       需预备提示在未发口令 / 口令待确认 / 就绪已失效（前置流水变化或故障）时触发、成组触发
  *       或双人复核确认同样 422（附 needs_prep / prep_status，不改任何数据）；
  *       封场前核对存在阻项（未完成提示 / 待复核申请 / 未解除故障 / 待签收交接单）
+ *
+ * 节奏计划（planned_seconds / tolerance_seconds）：
+ *   草稿可填非负整数（保存允许暂存非法值并回传校验错误；非法值不落库为计划），发布前校验
+ *   计划秒数非负整数且按提示顺序不递减，非法 422；发布后随版本锁定。执行台以原演出启动时间
+ *   为计时起点（接续演出回溯最初演出），对有计划提示给出 early/ontime/late/skipped/overdue/pending
+ *   分类与偏差秒数（跳过不计偏差）；撤回退出当前统计、重触发按新流水重算；接续核对阻止已留痕
+ *   编号的计划参数改变；封场报告固定最终节奏分类与汇总。
  */
 const { db, withTx } = require('./db');
 const { validateCues, CUE_TYPES } = require('./validate');
+const rhythm = require('./rhythm');
 
 class HttpError extends Error {
   constructor(status, message, extra) {
@@ -54,6 +62,9 @@ const HINT_FLAG_TEXT = {
 
 function sanitizeCue(raw) {
   const deps = Array.isArray(raw && raw.deps) ? raw.deps : [];
+  // 节奏计划：计划秒数 / 容许偏差秒数均为非负整数；非法值标记 _*_invalid（草稿暂存不报错，
+  // 由 validateCues 汇总；落库时非法值按"未设置计划"处理，避免脏数据）
+  const plan = rhythm.parsePlanFields(raw);
   return {
     label: String((raw && raw.label) != null ? raw.label : '').trim().slice(0, 50),
     type: CUE_TYPES.includes(raw && raw.type) ? raw.type : 'other',
@@ -61,6 +72,10 @@ function sanitizeCue(raw) {
     deps: [...new Set(deps.map((d) => String(d).trim()).filter(Boolean))].slice(0, 50),
     needs_review: raw && raw.needs_review ? 1 : 0,
     needs_prep: raw && raw.needs_prep ? 1 : 0,
+    planned_seconds: plan.planned_seconds,
+    tolerance_seconds: plan.tolerance_seconds,
+    _planned_invalid: plan.planned_invalid,
+    _tolerance_invalid: plan.tolerance_invalid,
   };
 }
 
@@ -510,8 +525,8 @@ route('POST', '/api/shows/:id/versions', (body, p) => {
     const newId = Number(info.lastInsertRowid);
     if (base) {
       const cues = db.prepare('SELECT * FROM cues WHERE version_id = ? ORDER BY seq').all(base.id);
-      const ins = db.prepare('INSERT INTO cues (version_id, seq, label, type, description, deps, needs_review, needs_prep) VALUES (?,?,?,?,?,?,?,?)');
-      for (const c of cues) ins.run(newId, c.seq, c.label, c.type, c.description, c.deps, c.needs_review, c.needs_prep);
+      const ins = db.prepare('INSERT INTO cues (version_id, seq, label, type, description, deps, needs_review, needs_prep, planned_seconds, tolerance_seconds) VALUES (?,?,?,?,?,?,?,?,?,?)');
+      for (const c of cues) ins.run(newId, c.seq, c.label, c.type, c.description, c.deps, c.needs_review, c.needs_prep, c.planned_seconds, c.tolerance_seconds);
     }
     return { version: getVersion(newId), cues: getVersionCues(newId) };
   });
@@ -533,8 +548,8 @@ route('PUT', '/api/versions/:id/cues', (body, p) => {
   const cues = body.cues.map(sanitizeCue);
   withTx(() => {
     db.prepare('DELETE FROM cues WHERE version_id = ?').run(version.id);
-    const ins = db.prepare('INSERT INTO cues (version_id, seq, label, type, description, deps, needs_review, needs_prep) VALUES (?,?,?,?,?,?,?,?)');
-    cues.forEach((c, i) => ins.run(version.id, i + 1, c.label, c.type, c.description, JSON.stringify(c.deps), c.needs_review, c.needs_prep));
+    const ins = db.prepare('INSERT INTO cues (version_id, seq, label, type, description, deps, needs_review, needs_prep, planned_seconds, tolerance_seconds) VALUES (?,?,?,?,?,?,?,?,?,?)');
+    cues.forEach((c, i) => ins.run(version.id, i + 1, c.label, c.type, c.description, JSON.stringify(c.deps), c.needs_review, c.needs_prep, c.planned_seconds, c.tolerance_seconds));
   });
   // 草稿允许暂存不完整内容，同时返回校验结果供界面提示
   return { ok: true, errors: validateCues(cues), cues: getVersionCues(version.id) };
@@ -705,6 +720,31 @@ route('GET', '/api/performances/:id', (body, p) => {
   }
   for (const c of cueStates) c.prep_command = activePrepByCue.get(c.id) || null;
 
+  // 节奏统计：以原演出启动时间（接续演出回溯最初演出）为计时起点，仅统计有计划的提示。
+  // 当前有效结果触发 → 提前/准时/逾时（附偏差秒数，跳过不计偏差）；未执行 → 逾时待执行/待执行；
+  // 撤回使原触发退出当前统计（eventByCue 已删），按未执行重判；承接触发按原操作时间计算。
+  const timingOrigin = timingOriginIso(perf.id);
+  const rhythmView = rhythm.buildRhythmView(cues, eventByCue, timingOrigin);
+  const rhythmItemByCueId = new Map(rhythmView.items.map((it) => [it.cue_id, it]));
+  for (const c of cueStates) c.rhythm = rhythmItemByCueId.get(c.id) || null;
+
+  // 历史流水回看：每条 fired/skipped 流水保留其当时分类与偏差（retracted 不带分类，
+  // 仅表明原触发已退出当前统计）；不随草稿或后续版本变化（计划参数随版本锁定）。
+  const rhythmByEventId = new Map();
+  for (const e of events) {
+    const cue = cues.find((c) => c.id === e.cue_id) || null;
+    const cls = rhythm.classifyEvent(e, cue, timingOrigin);
+    if (cls) {
+      rhythmByEventId.set(e.id, {
+        rhythm_status: cls.status,
+        rhythm_status_text: cls.status_text,
+        deviation_seconds: cls.deviation_seconds,
+        planned_seconds: cue.planned_seconds,
+        tolerance_seconds: cue.tolerance_seconds == null ? 0 : cue.tolerance_seconds,
+      });
+    }
+  }
+
   // 现场换班交接：当前待签收交接单（附按最新状态实时计算的差异）与全部交接历史
   // （已签收为不可变历史；被重提替换 / 接续作废旧单同样留痕）
   const pendingHandover = pendingHandoverRow(perf.id);
@@ -721,7 +761,13 @@ route('GET', '/api/performances/:id', (body, p) => {
     continuation,
     continue_targets: targets,
     cues: cueStates,
-    events: events.slice().reverse(),
+    events: events.slice().reverse().map((e) => ({
+      ...e,
+      // 历史回看：fired/skipped 附当时节奏分类与偏差；retracted 无分类（原触发已退出统计）
+      rhythm: rhythmByEventId.get(e.id) || null,
+    })),
+    rhythm: rhythmView.summary,
+    rhythm_items: rhythmView.items,
     review_requests: reviewRequests,
     faults,
     active_fault_count: activeFaults.length,
@@ -1371,6 +1417,15 @@ function continuationChain(performanceId) {
 }
 
 /**
+ * 节奏计时起点：每场演出以「原演出启动时间」为计时起点。
+ * 接续演出（含多次接续）沿链回溯到最初启动演出；返回最初演出的 started_at。
+ */
+function timingOriginIso(performanceId) {
+  const root = continuationChain(performanceId).at(-1);
+  return root ? root.started_at : null;
+}
+
+/**
  * 按编号汇总整条接续链中"有任意痕迹"的提示：触发/跳过/撤回流水、复核申请、承接结果。
  * 返回 Map<label, { label, flags:Set, records:[{...}], pending:[request...] }>。
  */
@@ -1501,6 +1556,22 @@ function buildContinuationPlan(perf, target) {
     if (Boolean(tc.needs_review) !== Boolean(cur.needs_review)) {
       addConflict(label, `复核标记不一致：v${target.version_number} 为${tc.needs_review ? '需复核' : '无需复核'}，当前为${cur.needs_review ? '需复核' : '无需复核'}`);
     }
+    // 节奏计划参数随版本锁定：已留痕编号（含未设置计划的旧版提示）在新版不得改变
+    // 计划秒数或容许偏差秒数（设置 / 取消 / 改值都按编号冲突列出，须改回后再接续）
+    if ((cur.planned_seconds ?? null) !== (tc.planned_seconds ?? null)) {
+      addConflict(
+        label,
+        `计划秒数被修改：${cur.planned_seconds == null ? '当前版本未设置计划' : `当前为 ${cur.planned_seconds} 秒`}，`
+        + `${tc.planned_seconds == null ? `v${target.version_number} 未设置计划` : `v${target.version_number} 为 ${tc.planned_seconds} 秒`}`
+        + '（已有留痕编号的计划参数须原样保留）'
+      );
+    }
+    if ((cur.planned_seconds ?? null) != null && (cur.tolerance_seconds ?? 0) !== (tc.tolerance_seconds ?? 0)) {
+      addConflict(
+        label,
+        `容许偏差秒数被修改：当前为 ${cur.tolerance_seconds ?? 0} 秒，v${target.version_number} 为 ${tc.tolerance_seconds ?? 0} 秒（已有留痕编号的计划参数须原样保留）`
+      );
+    }
   }
 
   // 待处理复核申请：链上（防御性）与当前演出的 pending 申请全部列出并构成冲突
@@ -1540,14 +1611,17 @@ function buildContinuationPlan(perf, target) {
     }
   }
 
-  // 承接清单：当前演出的有效结果（fired/skipped；retracted=无有效结果，不承接）
+  // 承接清单：当前演出的有效结果（fired/skipped；retracted=无有效结果，不承接）。
+  // 接续沿用原演出计时起点：承接触发按原操作时间计算节奏（接续核对已保证有留痕编号计划参数不变）。
   const latestByCue = latestEventsByCue(perf.id);
+  const carriedOriginIso = timingOriginIso(perf.id);
   const carried = [];
   for (const cue of targetCues) {
     const cur = currentByLabel.get(cue.label);
     if (!cur) continue;
     const e = latestByCue.get(cur.id);
     if (e && e.action !== 'retracted') {
+      const carriedRhythm = rhythm.classifyEvent(e, cue, carriedOriginIso);
       carried.push({
         label: cue.label,
         action: e.action,
@@ -1555,6 +1629,13 @@ function buildContinuationPlan(perf, target) {
         created_at: e.created_at,
         source_event_id: e.id,
         target_cue_id: cue.id,
+        ...(carriedRhythm
+          ? {
+              projected_rhythm_status: carriedRhythm.status,
+              projected_rhythm_status_text: carriedRhythm.status_text,
+              projected_deviation_seconds: carriedRhythm.deviation_seconds,
+            }
+          : {}),
       });
     }
   }
@@ -2928,12 +3009,19 @@ function buildClosingReport(perf, closedBy, note, closedAt) {
     if (e.source === 'carried') carriedCount += 1; else manualCount += 1;
   }
 
+  // 节奏计划最终分类：以原演出启动时间为计时起点（接续演出回溯最初演出），承接触发按原操作
+  // 时间计算；封场后永久固定，不随草稿或后续版本变化。仅统计设置了计划的提示。
+  const rhythmOrigin = timingOriginIso(perf.id);
+  const finalRhythmView = rhythm.buildRhythmView(cues, latestByCue, rhythmOrigin, closedAt);
+  const rhythmByCueId = new Map(finalRhythmView.items.map((it) => [it.cue_id, it]));
+
   const final_results = cues.map((c) => {
     const e = latestByCue.get(c.id) || null;
     const effective = e && e.action !== 'retracted' ? e.action : null;
     if (effective === 'fired') firedCount += 1;
     if (effective === 'skipped') skippedCount += 1;
     const traced = e ? traceEventOrigin(e, versionNumberByPerfId) : null;
+    const rc = rhythmByCueId.get(c.id) || null;
     return {
       cue_id: c.id,
       label: c.label,
@@ -2943,7 +3031,13 @@ function buildClosingReport(perf, closedBy, note, closedAt) {
       deps: c.deps,
       needs_review: !!c.needs_review,
       needs_prep: !!c.needs_prep,
+      planned_seconds: c.planned_seconds,
+      tolerance_seconds: c.tolerance_seconds == null ? null : c.tolerance_seconds,
       final_status: effective, // fired / skipped / null（封场核对保证非 null）
+      // 节奏最终分类（未设置计划的提示为 null，不参与节奏统计）
+      rhythm_status: rc ? rc.status : null,
+      rhythm_status_text: rc ? rc.status_text : null,
+      deviation_seconds: rc ? rc.deviation_seconds : null,
       event_id: e ? e.id : null,
       operator: e ? e.operator : null,
       created_at: e ? e.created_at : null,
@@ -3023,6 +3117,12 @@ function buildClosingReport(perf, closedBy, note, closedAt) {
     manual_event_count: manualCount,
     carried_event_count: carriedCount,
     latest_event_id: eventMaxId,
+    rhythm: {
+      timing_origin: rhythmOrigin,
+      closed_at_used_as_now: closedAt,
+      items: finalRhythmView.items,
+      summary: finalRhythmView.summary,
+    },
     final_results,
     review_requests,
     faults,

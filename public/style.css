@@ -337,3 +337,14 @@ button.prep-btn { color: var(--prep); border-color: #2c5b66; margin-top: 2px; }
 .prep-history { margin-top: 10px; font-size: 13px; }
 .prep-history li { margin: 6px 0; padding-bottom: 6px; border-bottom: 1px dashed var(--border); }
 .prep-history .badge { margin-right: 4px; }
+
+/* 节奏计划：草稿输入框与执行台 / 报告的分类配色 */
+.plan-input, .tol-input { width: 78px; }
+.status.rhythm-early { color: #6fb3ff; }
+.status.rhythm-ontime { color: var(--fired); }
+.status.rhythm-late { color: #e08a6c; }
+.status.rhythm-skipped { color: var(--skipped); }
+.status.rhythm-overdue { color: var(--blocked); font-weight: 800; }
+.status.rhythm-pending { color: var(--pending); }
+.rhythm-panel { border-left: 4px solid #8a7cff; margin-bottom: 16px; }
+.rhythm-panel .status, .rhythm-panel .muted { margin-right: 4px; }

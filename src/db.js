@@ -39,6 +39,9 @@ CREATE TABLE IF NOT EXISTS versions (
 -- needs_review=1 表示现场触发需双人复核（草稿可改，发布后随版本锁定）
 -- needs_prep=1 表示现场触发前需"预备确认"：舞台监督发预备口令、另一操作人确认就绪后
 --   才可触发（草稿可改，发布后随版本锁定；旧版本 / 既有提示默认 0，按无需预备处理）
+-- planned_seconds 为相对原演出开演的计划秒数（非负整数；NULL=未设置计划，不参与节奏统计）；
+-- tolerance_seconds 为容许偏差秒数（非负整数，仅在已设置计划时有意义，默认 0）。
+-- 计划参数草稿可填、发布后随版本锁定，且按提示顺序不递减（应用层校验）。
 CREATE TABLE IF NOT EXISTS cues (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   version_id   INTEGER NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
@@ -48,7 +51,9 @@ CREATE TABLE IF NOT EXISTS cues (
   description  TEXT NOT NULL DEFAULT '',
   deps         TEXT NOT NULL DEFAULT '[]',
   needs_review INTEGER NOT NULL DEFAULT 0,
-  needs_prep   INTEGER NOT NULL DEFAULT 0
+  needs_prep   INTEGER NOT NULL DEFAULT 0,
+  planned_seconds   INTEGER,
+  tolerance_seconds INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_cues_version ON cues(version_id, seq);
 
@@ -265,6 +270,22 @@ function migrateCuesNeedsPrepIfNeeded() {
 migrateCuesNeedsPrepIfNeeded();
 
 /**
+ * 旧库迁移：cues 表新增节奏计划列（planned_seconds / tolerance_seconds）。
+ * 既有提示（含已发布旧版本）默认 NULL，按"未设置计划、不参与节奏统计"处理。新库为空操作。
+ */
+function migrateCuesPlanIfNeeded() {
+  const cols = db.prepare('PRAGMA table_info(cues)').all();
+  const has = (name) => cols.some((c) => c.name === name);
+  if (!has('planned_seconds')) db.exec('ALTER TABLE cues ADD COLUMN planned_seconds INTEGER');
+  if (!has('tolerance_seconds')) db.exec('ALTER TABLE cues ADD COLUMN tolerance_seconds INTEGER');
+  if (!has('planned_seconds') || !has('tolerance_seconds')) {
+    console.log('[init] 已迁移 cues 表：新增节奏计划列（planned_seconds / tolerance_seconds，既有提示默认未设置计划）');
+  }
+}
+
+migrateCuesPlanIfNeeded();
+
+/**
  * 旧库迁移：performances 表新增接续相关列
  * （status 读写状态、continued_from_performance_id 来源演出、continued_at/by 接续时间与操作人）。
  * 既有演出均为现场启动、可操作，status 默认 active。新库此函数为空操作。
@@ -370,45 +391,48 @@ function seedDemoIfEmpty() {
     "INSERT INTO versions (show_id, version_number, status, note, published_at) VALUES (?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
   );
   const insertCue = db.prepare(
-    'INSERT INTO cues (version_id, seq, label, type, description, deps, needs_review, needs_prep) VALUES (?,?,?,?,?,?,?,?)'
+    'INSERT INTO cues (version_id, seq, label, type, description, deps, needs_review, needs_prep, planned_seconds, tolerance_seconds) VALUES (?,?,?,?,?,?,?,?,?,?)'
   );
   const insertPerformance = db.prepare(
-    'INSERT INTO performances (show_id, version_id, name, started_by) VALUES (?,?,?,?)'
+    "INSERT INTO performances (show_id, version_id, name, started_by, started_at) VALUES (?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now','-400 seconds'))"
   );
   const insertEvent = db.prepare(
-    "INSERT INTO cue_events (performance_id, cue_id, action, operator, reason) VALUES (?,?,?,?,?)"
+    "INSERT INTO cue_events (performance_id, cue_id, action, operator, reason, created_at) VALUES (?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now',?))"
   );
 
   withTx(() => {
     const showId = Number(insertShow.run('示例剧目《夜航》').lastInsertRowid);
 
     // 第 5 列：needs_review（1 = 现场触发需双人复核）；第 6 列：needs_prep（1 = 触发前需预备确认）
+    // 第 7 列：planned_seconds（相对开演计划秒数）；第 8 列：tolerance_seconds（容许偏差秒数）
     const demoCues = [
-      ['L1', 'light', '开场灯渐亮', '[]', 0, 0],
-      ['S1', 'sound', '开场音乐起', '["L1"]', 0, 0],
-      ['B1', 'set', '大幕升起', '["S1"]', 0, 0],
-      ['L2', 'light', '追光打在主角位', '["L1"]', 0, 1],
-      ['S2', 'sound', '远雷声', '["B1"]', 0, 0],
-      ['B2', 'set', '船台推出（危险机关，需双人复核）', '["B1","L2"]', 1, 0],
+      ['L1', 'light', '开场灯渐亮', '[]', 0, 0, 10, 2],
+      ['S1', 'sound', '开场音乐起', '["L1"]', 0, 0, 30, 3],
+      ['B1', 'set', '大幕升起', '["S1"]', 0, 0, 60, 5],
+      ['L2', 'light', '追光打在主角位', '["L1"]', 0, 1, 90, 5],
+      ['S2', 'sound', '远雷声', '["B1"]', 0, 0, 120, 10],
+      ['B2', 'set', '船台推出（危险机关，需双人复核）', '["B1","L2"]', 1, 0, 180, 10],
     ];
 
     const v1 = Number(insertVersion.run(showId, 1, 'published', '首演版').lastInsertRowid);
-    demoCues.forEach((c, i) => insertCue.run(v1, i + 1, c[0], c[1], c[2], c[3], c[4], c[5]));
+    demoCues.forEach((c, i) => insertCue.run(v1, i + 1, c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]));
 
-    // v2 已发布：新增 S3 并调整 L2 描述（编号、类型、前置、复核 / 预备标记均保留），可作为接续目标
+    // v2 已发布：新增 S3 并调整 L2 描述（编号、类型、前置、复核 / 预备 / 计划参数均保留），可作为接续目标
     const v2 = Number(insertVersion.run(showId, 2, 'published', '现场修订版：新增雨声 S3').lastInsertRowid);
     demoCues.forEach((c, i) => {
       const desc = c[0] === 'L2' ? '追光打在主角位（提亮）' : c[2];
-      insertCue.run(v2, i + 1, c[0], c[1], desc, c[3], c[4], c[5]);
+      insertCue.run(v2, i + 1, c[0], c[1], desc, c[3], c[4], c[5], c[6], c[7]);
     });
-    insertCue.run(v2, demoCues.length + 1, 'S3', 'sound', '雨声渐入（新增）', '["S2"]', 0, 0);
+    insertCue.run(v2, demoCues.length + 1, 'S3', 'sound', '雨声渐入（新增）', '["S2"]', 0, 0, 240, 10);
 
-    // 一场进行中的演出（v1）：L1 已触发、S1 已跳过，其余未执行，可直接体验接续到 v2
+    // 一场进行中的演出（v1，400 秒前开演）：L1 在开演后约 200 秒触发（计划 10±2，属逾时）；
+    // S1 在约 30 秒跳过（跳过不计偏差）；B1/L2/S2/B2 未执行且已超计划上限（逾时待执行）。
+    // 可直接体验执行台节奏统计与接续到 v2（承接触发按原操作时间、以原演出开演为计时起点）
     const perfId = Number(insertPerformance.run(showId, v1, '9月30日 晚场（进行中）', '王导').lastInsertRowid);
     const cueIdByLabel = (versionId, label) =>
       db.prepare('SELECT id FROM cues WHERE version_id = ? AND label = ?').get(versionId, label).id;
-    insertEvent.run(perfId, cueIdByLabel(v1, 'L1'), 'fired', '张三', null);
-    insertEvent.run(perfId, cueIdByLabel(v1, 'S1'), 'skipped', '李四', '音乐设备故障，跳过开场音乐');
+    insertEvent.run(perfId, cueIdByLabel(v1, 'L1'), 'fired', '张三', null, '-200 seconds');
+    insertEvent.run(perfId, cueIdByLabel(v1, 'S1'), 'skipped', '李四', '音乐设备故障，跳过开场音乐', '-370 seconds');
   });
 
   console.log('[init] 已写入演示数据（SEED_DEMO=0 可关闭）');

@@ -20,6 +20,7 @@
 - **现场设备故障登记与解除**：舞台监督在当前可操作演出按提示编号登记故障（操作人 + 原因）；编号不属于该演出、信息为空或该编号已有未解除故障时拒绝。系统沿已发布执行单的前置关系标出故障提示及所有依赖它的后续提示；未解除期间受影响提示**不得触发**（单项触发、双人复核确认、成组预览与提交均按最新故障状态判 422），**待复核申请保留但不得确认**，跳过与撤回仍遵守原有规则；登记不改写任何既有执行流水。解除须记录操作人与原因，解除后按当前有效结果重算提示状态。故障登记 / 解除与现场操作、接续串行判定：接续前有未解除故障则拒绝且原演出保持可操作，已接续的只读演出不得登记或解除；执行台展示故障影响范围与登记 / 解除处理记录
 - **现场换班交接（交接单）**：舞台监督在**当前可操作演出**填写交班人、接班人（均非空且不能相同）与交接说明，生成一张**待签收交接单**；同一演出只保留一张待签收单（部分唯一索引保证）。交接单**固定当时快照**：各提示有效结果、最新流水位置、待复核申请、未解除故障（含影响范围），并列出尚未完成的提示及阻塞原因（前置未触发 / 待复核 / 故障冻结 / 待执行）。**交接期间现场操作照常进行**，不冻结任何操作；接班人签收时系统按最新状态**逐项核对**，任一快照内容已变化即返回分组差异、交接单保持待签收，交班人可据此**重提替换快照**（旧单标记「已被重提替换」并留痕，重提人须为原交班人）；全部一致才签收，签收记录不可变。交班人本人或其他人签收、重复签收均拒绝；接续后的只读演出只可回看交接单，不能提交、重提或签收（接续时未签收单自动作废留痕）。交接写操作与现场操作、复核、故障处置、接续在同一 `BEGIN IMMEDIATE` 事务内串行判定，执行台展示交接单快照与实时差异
 - **演出封场结项（封场报告）**：演出结束时舞台监督在**当前可操作演出**填写非空**结项人**与**封场说明**执行封场。封场前按当前演出版本**逐条核对提示**：每条都须有有效「已触发 / 已跳过」结果；同时**待复核申请、未解除故障、待签收交接单**均须处理完。若有阻项，按编号列出未完成提示（附阻塞原因）并分类列出其他阻项，返回 422——**演出保持可操作且不生成报告**。核对通过后在同一写事务内**一次性固定**结项时间、结项人与**不可变封场报告**：每条提示的最终结果及**原操作人、时间、流水与来源演出**；承接（carried）结果沿接续链**追溯原流水**（给出原演出 / 原流水与完整追溯链，沿用原操作人与时间，**不算本场再次触发**）。**已接续的只读演出不能封场**（只能封当前可操作的接续演出）；封场后原记录与不可变报告永久可回看，该演出的**单项与成组处置、复核、故障、交接及接续写操作全部拒绝，重复封场也拒绝**（统一 409）。封场判定与现场写操作在同一 `BEGIN IMMEDIATE` 事务内串行，未通过则整体回滚，不会留下部分结项。执行台与 HTTP API 均可查看封场报告
+- **提示节奏计划与统计**：排演时可在草稿为提示填写**相对开演的计划秒数** `planned_seconds` 与**容许偏差秒数** `tolerance_seconds`（均为非负整数、≤30 天；计划秒数按提示顺序**不递减**，容差留空默认 0；留空计划秒数 = 不设置计划）。保存草稿即回传非法项中文说明（非法值不落为计划），**不递减等非法计划发布会被 422 阻止**；**发布后随版本锁定**，旧版未设置计划的提示不参与节奏统计。每场演出以**原演出启动时间**为计时起点，执行台对有计划提示按当前有效结果实时展示**提前 / 准时 / 逾时 / 跳过**及**偏差秒数**（触发落在计划±容差内算准时，**跳过不计偏差**），未执行而超过计划上限的提示显示**逾时待执行**（窗口内为待执行）。**撤回使原触发退出当前统计**（提示按未执行重判），**重触发按新流水重新计算**，历史流水仍保留其当时分类可回看。**接续沿用原演出计时起点**（沿接续链回溯最初演出），**承接触发按原操作时间**计算偏差，未执行提示按新版计划判断；**接续核对阻止已留痕编号的计划参数改变**（设置 / 取消 / 改计划秒或容差均按编号列出冲突）。**封场报告固定最终分类与汇总**（提前 / 准时 / 逾时 / 跳过计数、按已触发统计的准时率与平均偏差），历史回看不随草稿或后续版本变化
 - **明确错误**：无已发布版本、非法依赖、前置未满足、缺少操作人 / 原因等均有中文错误提示
 
 ## 一键启动（Docker Compose）
@@ -54,13 +55,14 @@ npm start          # 或 node server.js
 ## 使用流程
 
 1. **新建场次** → 进入场次后「新建草稿」
-2. 在草稿编辑器中按序录入提示，前置提示填编号（逗号分隔）；危险或关键提示勾选「复核」列、需要预备确认的勾选「预备」列；随时「校验」
-3. 「校验并发布」→ 生成不可变执行单（如 v1），复核 / 预备标记随版本锁定
+2. 在草稿编辑器中按序录入提示，前置提示填编号（逗号分隔）；危险或关键提示勾选「复核」列、需要预备确认的勾选「预备」列；可在「计划秒 / 容差秒」列填相对开演的计划秒数与容许偏差（非负整数、计划秒不递减，留空=不设置计划）；随时「校验」
+3. 「校验并发布」→ 生成不可变执行单（如 v1），复核 / 预备标记与节奏计划随版本锁定
 4. 回到场次页「启动演出」，选择已发布版本 → 进入执行台
 5. 执行台中填写操作人，对提示执行「触发 / 跳过」；需复核提示点「申请触发」后在右侧「复核申请」面板由**另一操作人**确认（前置未齐会被拒并保持待复核），申请人可撤销、其他人可填原因驳回；误触发可点「撤回」并填写撤回人与原因；页面每 2.5 秒自动刷新，多人可同时操作；右侧展示复核申请处置记录与完整执行流水（含撤回记录）
    - **预备口令**：对「需预备」提示点卡片上的「发预备口令」或在「📢 预备口令」面板操作（顶部操作人框填舞台监督姓名），再由**另一位操作人**在面板点「确认就绪」（前置未齐 / 有故障会被拒，口令保持待确认）；就绪后提示卡片与面板显示「✓ 已就绪」，此时才可触发（成组触发同样要求就绪，需双人复核的提示须就绪后再确认申请）。前置流水变化或登记故障会使就绪立即失效（面板保留失效原因，解除故障不自动恢复），需重新发令确认；触发 / 跳过后口令消耗，撤回再触发须重新预备
    - 需要连续处置多条提示时，用顶部「📋 成组连续处置」：按顺序添加编号与动作（触发 / 跳过 / 撤回）、填写各项原因，先「逐项预览」确认每步前置 / 下游 / 复核判定，再「整组提交」（事务内重判，任一失败整组不留流水；需双人复核的提示不在此触发）
    - **现场设备故障**：点提示卡片上的「⚠ 登记故障」或顶部「⚠ 现场设备故障」面板，按编号填写原因登记；面板展示影响范围（故障源 + 全部下游）与处理记录。故障未解除时受影响提示的触发按钮与待复核「确认触发」按钮冻结（跳过 / 撤回照常）；设备恢复后在面板点「解除故障」并填写处理人 / 原因，提示状态立即按当前有效结果重算，全过程不改写既有流水
+   - **节奏统计**：执行台顶部与「⏱ 提示节奏统计」面板实时显示各有计划提示的提前 / 准时 / 逾时 / 逾时待执行 / 跳过及偏差秒（以原演出开演为计时起点）；撤回后该提示退出统计并按未执行重判，再次触发按新流水计算，历史记录保留当时分类；接续演出沿用原演出开演时间，承接触发按原操作时间显示偏差
 6. 排演中要改执行单：新建草稿（自动复制最新版本，含复核标记）→ 修改 → 发布为 v2；新演出即可选 v2，旧演出仍按 v1 回看
 7. **现场需改用新版**：进入当前演出执行台，点「改用修订执行单 → 发起接续」，选择更高的已发布版本、填写操作人，先「按编号核对」查看有痕迹编号（触发 / 跳过 / 撤回 / 复核 / 承接）与冲突，通过后「生成接续演出」。原演出立即只读（顶部横幅可跳到接续演出），接续演出继承有效结果并标注「承接」；需要再次修订时，只能从最新的接续演出发起下一次接续
 8. **现场换班**：执行台顶部「🔁 现场换班交接」面板填写交班人、接班人（须不同）与交接说明后「提交交接单」，面板即展示固定快照（各提示结果、最新流水位置、待复核申请、未解除故障、未完成提示及阻塞原因）；交接期间现场照常操作，页面 2.5 秒轮询会实时标出与快照的**差异**。接班人在面板填本人姓名点「逐项核对无误，签收」：有差异会被拒绝并列出差异，交班人点「交班人重提」即可用最新快照替换旧单（旧单留痕）；核对一致才签收，签收单进入下方不可变「交接历史」。只读（已接续）演出只可回看交接单
@@ -75,7 +77,8 @@ npm start          # 或 node server.js
 ```
 server.js            # HTTP 入口：API 分发、静态文件、统一错误处理
 src/db.js            # SQLite 连接、建表初始化、事务包装、演示数据
-src/validate.js      # 执行单校验：缺失引用 / 重复编号 / 自依赖 / 循环依赖
+src/validate.js      # 执行单校验：缺失引用 / 重复编号 / 自依赖 / 循环依赖 / 节奏计划非法与不递减
+src/rhythm.js        # 节奏计划解析与分类（提前/准时/逾时/跳过/逾时待执行/待执行，纯逻辑）
 src/api.js           # 全部 REST 接口与业务规则
 public/              # 前端单页应用（index.html / app.js / style.css）
 Dockerfile           # node:24-slim，零依赖构建
@@ -90,12 +93,12 @@ docker-compose.yml   # 一键启动 + 数据卷
 | GET | `/api/shows/:id` | 场次详情（版本 + 演出记录） |
 | POST | `/api/shows/:id/versions` | 新建草稿（默认复制最新版本） |
 | GET | `/api/versions/:id` | 版本快照（含提示与前置） |
-| PUT | `/api/versions/:id/cues` | 保存草稿（已发布返回 409） |
-| POST | `/api/versions/:id/validate` | 校验（缺失引用 / 循环依赖） |
+| PUT | `/api/versions/:id/cues` | 保存草稿（已发布返回 409）。提示可含 `planned_seconds`（相对开演计划秒数，非负整数；留空 / null=不设置计划；也兼容 `plan_seconds` 别名）与 `tolerance_seconds`（容许偏差秒数，非负整数，设置计划后留空默认 0，上限 30 天）；非法值不落为计划，错误随 `errors` 明确返回，计划秒数须按提示顺序不递减（未设置计划的不参与） |
+| POST | `/api/versions/:id/validate` | 校验（缺失引用 / 循环依赖 / 节奏计划非法 / 计划秒不递减） |
 | POST | `/api/versions/:id/publish` | 发布（校验失败 422 并附问题清单） |
 | POST | `/api/shows/:id/performances` | 启动演出（无已发布版本返回 400） |
-| GET | `/api/performances/:id` | 执行台状态（提示状态 + 事件流水 + 复核申请 + **设备故障** + **预备口令** + **交接单**；附 `continuation` 接续关系与 `continue_targets` 可接续目标版本；各提示附 `needs_review`、`needs_prep`、`pending_request`、当前活动预备口令 `prep_command`（无则 `null`）与故障字段 `fault_blocked` / `fault_blocked_labels` / `own_fault`；顶层附 `faults` 全部登记解除记录（含 `affected_labels`）与 `active_fault_count`、`prep_commands` 全部预备口令（含消耗 / 重发作废 / 失效及原因）与 `active_prep_count`；承接流水 `source:"carried"`；附当前待签收单 `handover`（含固定 `snapshot`，快照新增 `active_prep_commands` 与未完成提示的 `prep_none` / `prep_pending` 阻塞原因，按最新状态实时计算的 `live_diff` 新增「预备口令」差异组）及全部 `handover_history` 交接历史（`pending` / `signed` / `superseded`））；附封场信息 `closing`（未封场为 `null`；已封场含 `closed_by` / `closed_at` / `note` 与不可变 `report`，报告新增 `prep_commands` / `prep_counts` 与各最终结果的 `needs_prep`），`continuation.closed` 标识已封场，`performance.status` 新增 `closed`） |
-| POST | `/api/performances/:id/continue/preview` | **接续前按编号核对**（不改数据）：返回有痕迹编号及标记 `hints`、冲突清单 `conflicts`、待处理申请 `pending_requests`、拟承接结果 `carried` 与 `can_continue` |
+| GET | `/api/performances/:id` | 执行台状态（提示状态 + 事件流水 + 复核申请 + **设备故障** + **预备口令** + **交接单**；附 `continuation` 接续关系与 `continue_targets` 可接续目标版本；各提示附 `needs_review`、`needs_prep`、`pending_request`、当前活动预备口令 `prep_command`（无则 `null`）与故障字段 `fault_blocked` / `fault_blocked_labels` / `own_fault`；顶层附 `faults` 全部登记解除记录（含 `affected_labels`）与 `active_fault_count`、`prep_commands` 全部预备口令（含消耗 / 重发作废 / 失效及原因）与 `active_prep_count`；承接流水 `source:"carried"`；附当前待签收单 `handover`（含固定 `snapshot`，快照新增 `active_prep_commands` 与未完成提示的 `prep_none` / `prep_pending` 阻塞原因，按最新状态实时计算的 `live_diff` 新增「预备口令」差异组）及全部 `handover_history` 交接历史（`pending` / `signed` / `superseded`））；附封场信息 `closing`（未封场为 `null`；已封场含 `closed_by` / `closed_at` / `note` 与不可变 `report`，报告新增 `prep_commands` / `prep_counts` 与各最终结果的 `needs_prep`），`continuation.closed` 标识已封场，`performance.status` 新增 `closed`）；附节奏统计 `rhythm`（计时起点 `timing_origin` 取原演出启动时间，汇总 `early_count/ontime_count/late_count/skipped_count/overdue_count/pending_count/fired_count/executed_count/on_time_rate/avg_deviation_seconds/planned_count`；旧版无计划时 `planned_count:0`）与逐条 `rhythm_items`，各提示附 `cues[].rhythm`（`status`：`early/ontime/late/skipped/overdue/pending` + `status_text` + `deviation_seconds`，跳过 / 未执行无偏差，无计划为 `null`），每条 `events[]` 附历史回看分类 `rhythm`（retracted 为 `null`） |
+| POST | `/api/performances/:id/continue/preview` | **接续前按编号核对**（不改数据）：返回有痕迹编号及标记 `hints`、冲突清单 `conflicts`、待处理申请 `pending_requests`、拟承接结果 `carried` 与 `can_continue`。**已留痕编号的节奏计划参数（`planned_seconds` / `tolerance_seconds`，含设置 / 取消计划）若在新版改变按编号列入 `conflicts`；`carried[]` 附 `projected_rhythm_status` / `projected_deviation_seconds`（沿用原演出计时起点、按原操作时间）** |
 | POST | `/api/performances/:id/continue` | **生成接续演出**（body：`version_id` 目标版本、`operator` 必填、`name` 可选）。成功返回新演出与承接清单；冲突 409 附编号与原因；只读演出 / 非更高或未发布目标 4xx |
 | POST | `/api/performances/:id/batch/preview` | **成组连续处置·逐项预览**（不改数据）：body `{operator, items:[{label,action,reason}]}`，`action` 为 `fire/skip/retract`。返回逐项判定 `results`、成功/失败计数与 `can_submit`；空清单、重复编号、非法动作 400；只读演出 409。**需预备提示的触发须口令已就绪（未发 / 待确认 / 已失效该步 422，附 `prep_status`）；组内前序步骤改变前置流水会使后续就绪口令在内存态级联失效；触发 / 跳过逐项消耗口令** |
 | POST | `/api/performances/:id/batch` | **成组连续处置·整组提交**：事务内按最新状态重新逐项判定，全部通过才依次写入与单项一致的流水并返回各项结果；任一项失败回滚、**整组不产生流水**，4xx 附逐项 `results`（含序号、编号、原因）；只读演出 409。**受未解除设备故障影响的编号触发判 422（附 `blocked_by_faults`），跳过 / 撤回不受故障影响** |
@@ -105,7 +108,7 @@ docker-compose.yml   # 一键启动 + 数据卷
 | POST | `/api/performances/:id/handover/check` | **签收前只读核对**（不改数据）：返回待签收交接单、`matched`、`diff_count`、分组差异 `groups` 与打平清单 `diffs`；无待签收单 409 |
 | POST | `/api/performances/:id/handover/sign` | **接班人签收**（body：`operator` 必填，须为接班人本人）：交班人本人或其他人签收 409；重复签收 409；只读演出 409；快照后现场有任何变化则 409 返回 `groups` / `diffs` 差异且交接单保持待签收；全部一致才置 `signed`（记录 `signed_at`，不可变历史） |
 | POST | `/api/performances/:id/closeout/check` | **封场前只读核对**（不改数据）：返回 `can_close`、四类阻项 `blockers`（`pending_cues` 按编号附阻塞原因、`review_requests`、`active_faults`、`pending_handovers`）与 `counts`；已封场 / 只读演出 409 |
-| POST | `/api/performances/:id/closeout` | **执行封场**（body：`closed_by` 结项人、`note` 封场说明，均非空否则 400）：事务内串行最终核对，有阻项 422 且**演出保持可操作、不生成报告**；已接续只读演出不能封场 409。通过后一次性固定结项时间 / 结项人 / 不可变 `report` 并把演出置为 `closed`，返回 `{ closing, performance }`；重复封场 409。封场后该演出全部写操作（单项 / 成组 / 复核 / 故障 / 交接 / 接续）统一 409 |
+| POST | `/api/performances/:id/closeout` | **执行封场**（body：`closed_by` 结项人、`note` 封场说明，均非空否则 400）：事务内串行最终核对，有阻项 422 且**演出保持可操作、不生成报告**；已接续只读演出不能封场 409。通过后一次性固定结项时间 / 结项人 / 不可变 `report` 并把演出置为 `closed`，返回 `{ closing, performance }`；重复封场 409。**`report.rhythm` 固定最终节奏分类（`items`：各有计划提示的 `status/deviation_seconds`；`summary`：提前/准时/逾时/跳过计数与准时率、平均偏差）与计时起点，`final_results[]` 附 `planned_seconds/tolerance_seconds/rhythm_status/rhythm_status_text/deviation_seconds`**；封场后该演出全部写操作（单项 / 成组 / 复核 / 故障 / 交接 / 接续）统一 409 |
 | GET | `/api/performances/:id/closeout` | **查看不可变封场报告**（执行台 GET 状态中也带 `closing` 字段）：未封场 404；只读 / 已封场演出均可查看 |
 | POST | `/api/performances/:id/cues/:cueId/fire` | 触发（前置未满足 422；**需预备提示未发口令 / 口令待确认 / 就绪已失效时 422，附 `needs_prep` 与 `prep_status`**；**受未解除设备故障影响 422 附 `blocked_by_faults`**；已有结果 409 附当前状态；只读演出 409）。**需复核提示调用本接口不会直接触发**，而是登记复核申请并返回 `{ request }`（申请阶段不受故障 / 预备限制，确认时才判定）；普通提示响应保持 `{ event }`（触发消耗已就绪预备口令，并可能使其他提示的就绪口令失效，响应附 `invalidated_prep`） |
 | POST | `/api/performances/:id/cues/:cueId/skip` | 跳过（缺原因 400；已有结果 409；待复核期间 409；只读演出 409） |
@@ -807,6 +810,104 @@ curl http://localhost:3000/api/performances/2
 
 成组处置中需预备提示的触发同样要求当前存在**已就绪**口令（逐项预览中未发 / 待确认 / 已失效均为该步 422，附 `prep_status`，`can_submit=false`）；组内前序步骤撤回 / 重发前置会使后续就绪口令在内存态级联失效，正式提交时任一就绪不满足则整组回滚、不留流水，提交成功后就绪口令随各自触发 / 跳过逐项消耗。接续演出的 GET 中 `prep_commands` 为空（不承接）；封场报告含全部口令历史（`report.prep_commands` / `report.prep_counts`）。
 
+## 提示节奏计划与统计（本轮新增）
+
+排演时可为草稿提示填写「相对开演的计划秒数」与「容许偏差秒数」，发布后随版本锁定；执行台以原演出启动时间为计时起点给出节奏分类与偏差。**所有能力均为可调用的 HTTP API**（下方 `curl` 可直接运行，把 `$BASE` 换成你的地址，默认 `http://localhost:3000`）。
+
+- 字段：`planned_seconds` 计划秒数（非负整数，0–2592000；留空 / null = 未设置计划），`tolerance_seconds` 容许偏差秒数（非负整数；设置计划后留空默认 0）；计划秒数**按提示顺序不递减**（只比较设置了计划的提示）。兼容旧字段别名 `plan_seconds`
+- 分类（仅设置了计划的提示；时间基准始终为**原演出启动时间**，接续演出回溯最初演出）：
+  - `early` 提前：触发时间早于 `计划 − 容差`；`ontime` 准时：落在 `计划 ± 容差`（含边界）；`late` 逾时：晚于 `计划 + 容差`
+  - `skipped` 跳过：**不计偏差**；`overdue` 逾时待执行：未执行且当前已超过计划上限；`pending` 待执行：未执行且尚未超上限
+  - 偏差秒 `deviation_seconds` = 触发相对开演秒数 − 计划秒数（正=晚、负=早，毫秒级精度保留 3 位小数）
+- **撤回**使原触发退出当前统计（该提示按未执行重新显示逾时待执行 / 待执行），重触发按新流水重新计算；原触发流水在历史中仍保留其当时分类
+- **接续**：承接触发按原操作时间、原演出开演计算（偏差与接续前一致），未执行提示按新版计划判断；接续核对会阻止有留痕编号改变计划参数
+- **封场报告**固定每条提示最终节奏分类与汇总，之后不随时间 / 草稿 / 新版本变化；**旧版未设置计划的提示不参与统计**
+
+```bash
+BASE=http://localhost:3000
+
+# 1) 草稿保存计划（已发布版本改计划返回 409）
+curl -s -XPUT "$BASE/api/versions/3/cues" -H 'Content-Type: application/json' -d '{
+  "cues": [
+    {"label":"L1","type":"light","planned_seconds":0,  "tolerance_seconds":2},
+    {"label":"S1","type":"sound","planned_seconds":30, "tolerance_seconds":3},
+    {"label":"B1","type":"set",  "planned_seconds":60},
+    {"label":"X9","type":"other","planned_seconds":40}
+  ]}'
+# → 200 {"ok":true,
+#   "errors":["计划秒数须按提示顺序不递减：第 4 条（X9）计划 40 秒，小于前一条设置计划的提示（第 3 条「B1」）的 60 秒"],
+#   "cues":[…,"planned_seconds":0,"tolerance_seconds":2,…]}
+# 非法格式（-1 / 1.5 / "10x"）同样在 errors 明确说明，非法值不落为计划；直接发布非法草稿 → 422 附 errors
+
+# 2) 发布锁定 → 启动演出 → 执行台查看实时节奏
+curl -s -XPOST "$BASE/api/versions/3/publish" -d '{}' -H 'Content-Type: application/json'
+curl -s -XPOST "$BASE/api/shows/1/performances" -H 'Content-Type: application/json' \
+  -d '{"version_id":3,"name":"10月3日晚场","operator":"王监"}'
+curl -s "$BASE/api/performances/10"
+# → 顶层：
+# {
+#   "rhythm": {
+#     "timing_origin":"2026-10-03T12:00:00.000Z","elapsed_seconds":41.2,
+#     "planned_count":3,"early_count":0,"ontime_count":1,"late_count":0,
+#     "skipped_count":1,"overdue_count":0,"pending_count":1,
+#     "executed_count":2,"fired_count":1,"on_time_rate":1.0,"avg_deviation_seconds":0.21
+#   },
+#   "rhythm_items":[
+#     {"label":"L1","planned_seconds":0,"tolerance_seconds":2,"status":"ontime","status_text":"准时","deviation_seconds":0.21,"event_id":11,"source":"manual"},
+#     {"label":"S1","planned_seconds":30,"tolerance_seconds":3,"status":"skipped","status_text":"跳过","deviation_seconds":null,"event_id":12,"source":"manual"},
+#     {"label":"B1","planned_seconds":60,"tolerance_seconds":0,"status":"pending","status_text":"待执行","deviation_seconds":null,"event_id":null,"source":null}
+#   ],
+#   "cues":[{"label":"L1",…,"rhythm":{…同上…}}, {"label":"X9",…,"rhythm":null}],
+#   "events":[{"action":"fired","label":"L1","rhythm":{"rhythm_status":"ontime","rhythm_status_text":"准时","deviation_seconds":0.21,"planned_seconds":0,"tolerance_seconds":2},…},
+#             {"action":"skipped","label":"S1","rhythm":{"rhythm_status":"skipped",…}},
+#             {"action":"retracted","label":"L1","rhythm":null,…}]
+# }
+
+# 3) 撤回退出当前统计（历史流水仍可回看其当时分类）；重触发按新流水重算
+curl -s -XPOST "$BASE/api/performances/10/cues/11/retract" -H 'Content-Type: application/json' \
+  -d '{"operator":"张三","reason":"误触发"}'
+# → 200 {"event":{"action":"retracted",…}}；随后 GET 中 L1 的 cues[].rhythm 按未执行重判，
+#   历史 fired 记录的 rhythm 仍为当时的 early/ontime/late，retracted 记录 rhythm=null
+
+# 4) 接续核对：已留痕编号的计划参数被改 → 冲突（原演出保持可操作）
+curl -s -XPOST "$BASE/api/performances/10/continue/preview" -H 'Content-Type:application/json' -d '{"version_id":4}'
+# → 200
+# {
+#   "can_continue":false,
+#   "conflicts":[
+#     {"label":"L1","reasons":["计划秒数被修改：当前为 0 秒，v4 为 5 秒（已有留痕编号的计划参数须原样保留）"]},
+#     {"label":"S1","reasons":["容许偏差秒数被修改：当前为 3 秒，v4 为 0 秒（已有留痕编号的计划参数须原样保留）"]}
+#   ],
+#   "carried":[
+#     {"label":"L1","action":"fired","operator":"张三","created_at":"…","projected_rhythm_status":"ontime","projected_deviation_seconds":0.21,…},
+#     {"label":"S1","action":"skipped","projected_rhythm_status":"skipped","projected_deviation_seconds":null,…}
+#   ]
+# }
+# 执行接续（计划一致才成功）：
+curl -s -XPOST "$BASE/api/performances/10/continue" -H 'Content-Type: application/json' \
+  -d '{"version_id":5,"operator":"王监"}'
+# → 200 {"performance":{"id":12,"continued_from_performance_id":10,…},"carried_count":3,…}
+# GET /api/performances/12 中 rhythm.timing_origin == 演出 #10 的 started_at（承接触发偏差不变，
+# 新增未执行提示按 v5 计划显示 pending/overdue）
+
+# 5) 封场报告固定最终节奏分类与汇总（封场后永久不变）
+curl -s -XPOST "$BASE/api/performances/12/closeout" -H 'Content-Type: application/json' \
+  -d '{"closed_by":"王监","note":"全场顺利结束"}'
+# → 200
+# {"closing":{"report":{
+#   "rhythm":{
+#     "timing_origin":"…（原演出开演）","closed_at_used_as_now":"…",
+#     "summary":{"planned_count":4,"early_count":0,"ontime_count":2,"late_count":1,
+#                "skipped_count":1,"overdue_count":0,"pending_count":0,
+#                "on_time_rate":0.667,"avg_deviation_seconds":4.1},
+#     "items":[{label,planned_seconds,tolerance_seconds,status,status_text,deviation_seconds,…}]
+#   },
+#   "final_results":[{"label":"L1","planned_seconds":0,"tolerance_seconds":2,
+#                     "rhythm_status":"ontime","rhythm_status_text":"准时","deviation_seconds":0.21,…}]
+# }}}
+# GET /api/performances/12/closeout 可随时回看；未设置计划的旧版演出 planned_count=0、各提示 rhythm_status=null
+```
+
 ## 数据与并发说明
 
 - `cue_events` 为**流水表**：触发 / 跳过 / 撤回逐条追加，全量留痕；同一演出同一提示的「当前有效结果」由最新一条事件推导（`retracted` 表示已撤回、当前无有效结果），至多一个当前有效结果。`source` 区分 `manual`（现场操作）与 `carried`（接续时自来源演出承接，附 `carried_from_performance_id` / `carried_from_event_id`，沿用原操作人与时间，非再次触发）
@@ -819,6 +920,6 @@ curl http://localhost:3000/api/performances/2
 - 触发、跳过、撤回、复核处置、成组提交、**故障登记 / 解除**、**预备口令发出 / 确认**、**交接提交 / 重提 / 签收**、**封场核对 / 执行**与**接续**均在 `BEGIN IMMEDIATE` 事务内「读最新事件 / 申请 / 故障 / 预备口令 / 交接单 / 演出状态 → 判定 → 写入」，并发操作串行判定，后到的冲突请求收到对应错误与当前状态（操作人、时间、原因、故障清单、预备口令状态、交接差异、接续演出位置、封场阻项清单）。交接单本身**不冻结任何现场操作**：交接期间触发 / 跳过 / 撤回 / 复核 / 成组 / 故障 / 预备照常，变化只在签收核对时体现为差异。未解除故障只冻结受影响提示的**触发**（含复核确认、预备确认），跳过与撤回按原有规则判定；**需预备提示的触发（含成组与复核确认）必须持有当前仍满足条件（前置流水 id 快照一致且无故障影响）的已就绪口令，任何写事务后就绪口令都会被重新扫描，失效即留痕且不自动恢复**；成组提交在事务内对整组清单**重新逐项判定**，任一项失败整体回滚（含同组已拟写入项），因此成组提交不可能只落一半流水；**封场在事务内对当前版本逐条复核提示结果与四类阻项，任一不满足整体回滚，演出保持可操作，不可能出现部分结项**；成组预览、封场核对为只读判定（Node 单线程同步读，不穿插写操作），不写任何数据
 - 前置是否满足、提示状态（待执行/已触发/已跳过/受阻）均按**当前有效结果**计算：前置被撤回后，未执行的下游提示重新变为受阻；复核确认时同样按当前有效结果判定，前置失效或存在故障则确认拒绝且申请保持待复核；接续后未执行提示一律按**新版依赖**重算（承接的已触发计入满足）
 - 接续前的按编号核对覆盖**整条接续链**（当前演出 + 逐级来源演出）：任一环节有触发 / 跳过 / 撤回流水、复核申请或承接结果的编号都须在新版保留其编号、类型、描述、前置集合与复核标记，且当前无待处理申请，否则整体拒绝并按编号返回原因
-- 旧版数据库启动时自动迁移：`cue_events` 唯一约束表重建为流水表、`cues` 补 `needs_review` 列（既有提示默认 0，按无需复核处理），`performances` 补 `status / continued_from_performance_id / continued_at / continued_by` 列（既有演出默认 `active`），`cue_events` 补 `source / carried_from_*` 列（既有流水默认 `manual`），并自动新建 `cue_faults` 故障登记表（含 active 部分唯一索引）与 `cue_handovers` 交接单表（含 pending 部分唯一索引）；再把 `performances.status` 的 CHECK 扩展为允许 `closed`（检测后重建表、保留全部列与记录）并新建 `performance_closings` 封场表；本轮再给 `cues` 补 `needs_prep` 列（既有提示默认 0，按无需预备处理）并新建 `cue_prep_commands` 预备口令表（含 `pending/ready` 活动口令部分唯一索引），全部历史记录保留，无需手工操作
+- 旧版数据库启动时自动迁移：`cue_events` 唯一约束表重建为流水表、`cues` 补 `needs_review` 列（既有提示默认 0，按无需复核处理），`performances` 补 `status / continued_from_performance_id / continued_at / continued_by` 列（既有演出默认 `active`），`cue_events` 补 `source / carried_from_*` 列（既有流水默认 `manual`），并自动新建 `cue_faults` 故障登记表（含 active 部分唯一索引）与 `cue_handovers` 交接单表（含 pending 部分唯一索引）；再把 `performances.status` 的 CHECK 扩展为允许 `closed`（检测后重建表、保留全部列与记录）并新建 `performance_closings` 封场表；本轮再给 `cues` 补 `needs_prep` 列（既有提示默认 0，按无需预备处理）并新建 `cue_prep_commands` 预备口令表（含 `pending/ready` 活动口令部分唯一索引）；再给 `cues` 补 `planned_seconds / tolerance_seconds` 节奏计划列（既有提示默认 NULL，按未设置计划、不参与节奏统计处理），全部历史记录保留，无需手工操作
 - 演出与版本通过外键绑定，版本发布后无更新入口（含 `needs_review` 标记），因此历史回看永远呈现演出当时的执行单内容；接续只新建演出并把原演出置为只读，**不改动任何版本快照**
 - 接续关系可在执行台顶部横幅与场次页演出记录中查看；只读演出仍可随时打开回看其流水、复核申请与当时版本
