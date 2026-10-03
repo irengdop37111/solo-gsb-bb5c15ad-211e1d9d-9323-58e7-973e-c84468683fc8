@@ -230,6 +230,8 @@ function collectEditorCues() {
     deps: c.depsText.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean),
     needs_review: !!c.needs_review,
     needs_prep: !!c.needs_prep,
+    planned_offset_seconds: (c.plannedText || '').trim(),
+    tolerance_seconds: (c.toleranceText || '').trim(),
   }));
 }
 
@@ -247,6 +249,8 @@ function renderEditorTable() {
       </td>
       <td><input type="text" data-i="${i}" data-f="description" value="${esc(c.description)}" placeholder="提示内容描述"></td>
       <td><input type="text" class="deps-input" data-i="${i}" data-f="depsText" value="${esc(c.depsText)}" placeholder="前置编号，逗号分隔"></td>
+      <td><input type="text" class="plan-input" data-i="${i}" data-f="plannedText" value="${esc(c.plannedText)}" placeholder="如 120" title="相对开演的计划秒数（非负整数，按提示顺序不递减）；留空表示不参与节奏统计"></td>
+      <td><input type="text" class="plan-input" data-i="${i}" data-f="toleranceText" value="${esc(c.toleranceText)}" placeholder="如 10" title="容许偏差秒数（非负整数）；填计划秒数而未填偏差时按 0 秒处理"></td>
       <td style="text-align:center"><input type="checkbox" data-i="${i}" data-f="needs_review" ${c.needs_review ? 'checked' : ''} title="现场触发需另一操作人复核确认"></td>
       <td style="text-align:center"><input type="checkbox" data-i="${i}" data-f="needs_prep" ${c.needs_prep ? 'checked' : ''} title="现场触发前需舞台监督发预备口令、另一操作人确认就绪"></td>
       <td style="white-space:nowrap">
@@ -299,7 +303,7 @@ async function renderVersion(id) {
         <p class="muted">发布于 ${fmtTime(version.published_at)}　${esc(version.note || '')}</p>
         <div class="panel">
           <table>
-            <thead><tr><th>#</th><th>编号</th><th>类型</th><th>描述</th><th>前置提示</th><th>复核</th><th>预备</th></tr></thead>
+            <thead><tr><th>#</th><th>编号</th><th>类型</th><th>描述</th><th>前置提示</th><th>计划</th><th>复核</th><th>预备</th></tr></thead>
             <tbody>
               ${cues.map(c => `
                 <tr>
@@ -308,6 +312,9 @@ async function renderVersion(id) {
                   <td>${TYPE_TEXT[c.type] || c.type}</td>
                   <td>${esc(c.description)}</td>
                   <td>${c.deps.length ? c.deps.map(d => `<span class="dep-chip">${esc(d)}</span>`).join('') : '<span class="muted">无</span>'}</td>
+                  <td>${c.planned_offset_seconds != null
+                    ? `<span class="badge pace-badge" title="相对开演的计划秒数与容许偏差秒数">T+${c.planned_offset_seconds}s ±${c.tolerance_seconds == null ? 0 : c.tolerance_seconds}s</span>`
+                    : '<span class="muted">—</span>'}</td>
                   <td>${c.needs_review ? '<span class="badge review">双人复核</span>' : '<span class="muted">—</span>'}</td>
                   <td>${c.needs_prep ? '<span class="badge prep-badge">需预备</span>' : '<span class="muted">—</span>'}</td>
                 </tr>`).join('')}
@@ -335,14 +342,16 @@ async function renderVersion(id) {
       label: c.label, type: c.type, description: c.description, depsText: c.deps.join(', '),
       needs_review: !!c.needs_review,
       needs_prep: !!c.needs_prep,
+      plannedText: c.planned_offset_seconds == null ? '' : String(c.planned_offset_seconds),
+      toleranceText: c.tolerance_seconds == null ? '' : String(c.tolerance_seconds),
     }));
 
     app.innerHTML = `
       <h1>执行单 v${version.version_number} <span class="badge draft">草稿</span></h1>
-      <p class="muted">前置提示填写其他提示的编号（逗号分隔）。勾选「复核」的提示现场触发时需另一操作人确认；勾选「预备」的提示现场须先发预备口令、由另一操作人确认就绪后才可触发（标记均随发布锁定，旧版按无需处理）。保存不影响已开始的演出。</p>
+      <p class="muted">前置提示填写其他提示的编号（逗号分隔）。勾选「复核」的提示现场触发时需另一操作人确认；勾选「预备」的提示现场须先发预备口令、由另一操作人确认就绪后才可触发（标记均随发布锁定，旧版按无需处理）。「计划（秒）」为相对开演的计划秒数、「偏差（秒）」为容许偏差秒数（均为非负整数，计划秒数按提示顺序不递减；两列留空表示该提示不参与节奏统计，发布后随版本锁定）。保存不影响已开始的演出。</p>
       <div class="panel">
         <table class="editor-table">
-          <thead><tr><th>#</th><th>编号</th><th>类型</th><th>描述</th><th>前置提示</th><th>复核</th><th>预备</th><th>操作</th></tr></thead>
+          <thead><tr><th>#</th><th>编号</th><th>类型</th><th>描述</th><th>前置提示</th><th>计划(秒)</th><th>偏差(秒)</th><th>复核</th><th>预备</th><th>操作</th></tr></thead>
           <tbody id="editor-tbody"></tbody>
         </table>
         <div class="row" style="margin-top:12px">
@@ -360,7 +369,7 @@ async function renderVersion(id) {
     renderEditorTable();
 
     document.getElementById('add-cue').onclick = () => {
-      editorCues.push({ label: '', type: 'light', description: '', depsText: '' });
+      editorCues.push({ label: '', type: 'light', description: '', depsText: '', plannedText: '', toleranceText: '' });
       renderEditorTable();
     };
 
@@ -430,7 +439,7 @@ async function renderPerformance(id) {
   } catch (e) { app.innerHTML = `<div class="error-list">${esc(e.message)}</div>`; }
 }
 
-function drawPerformance(id, { performance: perf, continuation, continue_targets: targets, cues, events, review_requests: reviewRequests, faults, active_fault_count: activeFaultCount, prep_commands: prepCommands, active_prep_count: activePrepCount, handover, handover_history: handoverHistory, closing }) {
+function drawPerformance(id, { performance: perf, continuation, continue_targets: targets, cues, events, review_requests: reviewRequests, faults, active_fault_count: activeFaultCount, prep_commands: prepCommands, active_prep_count: activePrepCount, handover, handover_history: handoverHistory, closing, pace }) {
   // 2.5s 轮询整体重绘：记住当前焦点与光标位置，重绘后恢复，避免输入被打断
   const active = document.activeElement;
   const focusKey = active && (active.dataset.focusKey || (active.id === 'operator-input' ? 'operator' : null));
@@ -457,6 +466,12 @@ function drawPerformance(id, { performance: perf, continuation, continue_targets
   const prepList = prepCommands || [];
   const readyPrepCount = prepList.filter(k => k.status === 'ready').length;
   const pendingPrepCount = prepList.filter(k => k.status === 'pending').length;
+
+  // 提示计划节奏：有计划提示的分类汇总（计时起点为原演出启动时间）
+  const paceSummary = pace && pace.planned_count ? pace.summary : null;
+  const paceChip = paceSummary
+    ? `<span class="status pace-chip" title="计时起点：演出 #${pace.origin.performance_id} 启动时间 ${fmtTime(pace.origin.started_at)}">⏱ 提前 ${paceSummary.early} · 准时 ${paceSummary.on_time} · 逾时 ${paceSummary.late} · 跳过 ${paceSummary.skipped}${paceSummary.overdue_pending ? ` · <b>逾时待执行 ${paceSummary.overdue_pending}</b>` : ''}</span>`
+    : '';
 
   // 正在操作人框中输入时保留 DOM 中的实时值（下方 innerHTML 重绘前取出），避免光标跳尾
   const opFocused = focusKey === 'operator';
@@ -488,6 +503,7 @@ function drawPerformance(id, { performance: perf, continuation, continue_targets
         ${activeFaults.length ? `<span class="status fault-active">⚠ 故障 ${activeFaults.length} · 冻结 ${blockedByFaultSet.size}</span>` : ''}
         ${pendingPrepCount ? `<span class="status prep-pending-chip">预备待确认 ${pendingPrepCount}</span>` : ''}
         ${readyPrepCount ? `<span class="status prep-ready-chip">✓ 已就绪 ${readyPrepCount}</span>` : ''}
+        ${paceChip}
         ${handover ? `<span class="status handover-pending-chip">🔁 交接待签收 · ${esc(handover.received_by)}</span>` : ''}
         <span class="grow"></span>
         <label>操作人 <input id="operator-input" type="text" value="${esc(opVal)}" placeholder="姓名" style="width:110px" ${locked ? 'disabled' : ''}></label>
@@ -1031,6 +1047,8 @@ function renderClosingReport(closing) {
   const handovers = r.handovers || [];
   const preps = r.prep_commands || [];
   const prepCounts = r.prep_counts || {};
+  const pace = r.pace || null;
+  const paceSum = pace && pace.planned_count ? pace.summary : null;
   const done = finals.filter(f => f.final_status);
   return `
     <div class="panel closing-panel closed">
@@ -1051,16 +1069,24 @@ function renderClosingReport(closing) {
         ${r.performance && r.performance.continuation_from_performance_id
           ? `<span>承接自演出 #${r.performance.continuation_from_performance_id}</span>` : ''}
       </div>
+      ${paceSum ? `
+      <div class="row muted" style="font-size:13px;margin-top:4px">
+        <span class="status pace-chip">⏱ 节奏（计划 ${pace.planned_count} 条）：提前 ${paceSum.early} · 准时 ${paceSum.on_time} · 逾时 ${paceSum.late} · 跳过 ${paceSum.skipped}</span>
+        <span title="计时起点为原演出启动时间">计时起点：演出 #${pace.origin.performance_id} · ${fmtTime(pace.origin.started_at)}</span>
+      </div>` : ''}
       <details open class="handover-details" style="margin-top:8px">
         <summary class="muted">最终提示结果（${done.length}/${finals.length}；含原操作人、时间、流水与来源；承接结果可追溯原流水）</summary>
         <div class="hint-table-wrap"><table class="hint-table closing-final-table">
-          <thead><tr><th style="width:36px">#</th><th style="width:70px">编号</th><th style="width:70px">最终结果</th><th style="width:80px">来源</th><th>操作人 / 原操作人</th><th>时间</th><th>流水</th></tr></thead>
+          <thead><tr><th style="width:36px">#</th><th style="width:70px">编号</th><th style="width:70px">最终结果</th><th style="width:110px">节奏</th><th style="width:80px">来源</th><th>操作人 / 原操作人</th><th>时间</th><th>流水</th></tr></thead>
           <tbody>
             ${finals.map(f => `
               <tr>
                 <td class="muted">${f.seq}</td>
                 <td><b>${esc(f.label)}</b>${f.needs_review ? ' <span class="badge review">复核</span>' : ''}${f.needs_prep ? ' <span class="badge prep-badge">预备</span>' : ''}</td>
                 <td>${f.final_status ? `<span class="status ${f.final_status}">${ACTION_TEXT(f.final_status)}</span>` : '<span class="muted">未完成</span>'}</td>
+                <td>${f.pace
+                  ? `<span class="pace-text pace-${f.pace.classification}" title="计划 T+${f.planned_offset_seconds}s ±${f.tolerance_seconds == null ? 0 : f.tolerance_seconds}s">${f.pace.classification_text}${f.pace.deviation_seconds != null ? ` ${f.pace.deviation_seconds > 0 ? '+' : ''}${f.pace.deviation_seconds}s` : ''}</span>`
+                  : '<span class="muted">—</span>'}</td>
                 <td>${f.source === 'carried'
                   ? `<span class="badge carried" title="沿接续链追溯，非本场再次触发">承接</span>`
                   : '<span class="muted">本场</span>'}</td>
@@ -1079,7 +1105,7 @@ function renderClosingReport(closing) {
                     : ''}
                 </td>
               </tr>
-              ${f.reason ? `<tr class="closing-reason-row"><td></td><td></td><td colspan="5" class="muted">原因：${esc(f.reason)}</td></tr>` : ''}
+              ${f.reason ? `<tr class="closing-reason-row"><td></td><td></td><td colspan="6" class="muted">原因：${esc(f.reason)}</td></tr>` : ''}
             `).join('')}
           </tbody>
         </table></div>
@@ -1811,6 +1837,28 @@ function ACTION_TEXT(a) {
   return a === 'fired' ? '已触发' : a === 'skipped' ? '已跳过' : '已撤回';
 }
 
+/* ---------- 提示计划节奏展示 ---------- */
+
+// 单条计划提示的节奏描述（分类 + 偏差秒数；跳过不计偏差）
+function paceText(p) {
+  const dev = p.deviation_seconds;
+  const devText = dev == null ? '' : `${dev > 0 ? '+' : ''}${dev}s`;
+  switch (p.classification) {
+    case 'early': return `提前 ${devText} 触发`;
+    case 'on_time': return `准时（偏差 ${devText}）`;
+    case 'late': return `逾时 ${devText} 触发`;
+    case 'skipped': return '已跳过（不计偏差）';
+    case 'overdue_pending': return `逾时待执行（已超计划上限 ${p.overdue_seconds}s）`;
+    default: return `待执行（距计划约 ${p.seconds_to_planned}s）`;
+  }
+}
+
+function paceLineHtml(c) {
+  const p = c.pace;
+  if (!p) return '';
+  return `<div class="cue-event"><span class="pace-text pace-${p.classification}">⏱ 计划 T+${p.planned_offset_seconds}s ±${p.tolerance_seconds}s · ${paceText(p)}</span></div>`;
+}
+
 function cueCard(perfId, c, readonly) {
   const depsHtml = c.deps.length
     ? c.deps.map(d => `<span class="dep-chip ${c.unmet.includes(d) ? 'unmet-chip' : 'met'}">${esc(d)}</span>`).join('')
@@ -1869,6 +1917,7 @@ function cueCard(perfId, c, readonly) {
         </div>
         ${c.description ? `<div class="cue-desc">${esc(c.description)}</div>` : ''}
         <div class="cue-deps">前置：${depsHtml}</div>
+        ${paceLineHtml(c)}
         ${blockedHtml}
         ${faultHtml}
         ${reviewHtml}

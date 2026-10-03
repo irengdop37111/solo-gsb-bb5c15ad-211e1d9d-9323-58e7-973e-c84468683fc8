@@ -337,3 +337,15 @@ button.prep-btn { color: var(--prep); border-color: #2c5b66; margin-top: 2px; }
 .prep-history { margin-top: 10px; font-size: 13px; }
 .prep-history li { margin: 6px 0; padding-bottom: 6px; border-bottom: 1px dashed var(--border); }
 .prep-history .badge { margin-right: 4px; }
+
+/* ---- 提示计划节奏（计划秒数 / 容许偏差 / 分类与偏差秒数） ---- */
+.badge.pace-badge { background: #1c2a3a; color: #7fb3e8; border: 1px solid #35506b; }
+.status.pace-chip { color: #7fb3e8; }
+.pace-text { font-weight: 600; font-size: 12px; }
+.pace-early { color: #6fc6d8; }
+.pace-on_time { color: var(--fired); }
+.pace-late { color: var(--blocked); }
+.pace-skipped { color: var(--skipped); }
+.pace-pending { color: var(--pending); }
+.pace-overdue_pending { color: var(--blocked); font-weight: 700; }
+.plan-input { width: 64px; }

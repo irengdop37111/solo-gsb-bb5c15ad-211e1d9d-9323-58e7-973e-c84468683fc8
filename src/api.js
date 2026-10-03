@@ -15,7 +15,7 @@
  *       封场前核对存在阻项（未完成提示 / 待复核申请 / 未解除故障 / 待签收交接单）
  */
 const { db, withTx } = require('./db');
-const { validateCues, CUE_TYPES } = require('./validate');
+const { validateCues, CUE_TYPES, isNonNegativeInt } = require('./validate');
 
 class HttpError extends Error {
   constructor(status, message, extra) {
@@ -52,8 +52,30 @@ const HINT_FLAG_TEXT = {
   carried: '有承接结果',
 };
 
+/**
+ * 计划秒数 / 容许偏差秒数的草稿解析：
+ * 空值（null/undefined/空串）→ null（未设置计划，不参与节奏统计）；
+ * 合法非负整数（数值或纯数字字符串）→ 数值；其余原样保留（截断），
+ * 由 validateCues 给出明确中文错误——草稿允许暂存非法值，发布时拦截。
+ */
+function sanitizePlanSeconds(raw) {
+  if (raw == null || raw === '') return null;
+  if (typeof raw === 'number' && Number.isInteger(raw) && raw >= 0) return raw;
+  if (typeof raw === 'string') {
+    const t = raw.trim();
+    if (t === '') return null;
+    if (isNonNegativeInt(t)) return Number(t);
+    return t.slice(0, 30);
+  }
+  return raw;
+}
+
 function sanitizeCue(raw) {
   const deps = Array.isArray(raw && raw.deps) ? raw.deps : [];
+  const planned = sanitizePlanSeconds(raw && raw.planned_offset_seconds);
+  let tolerance = sanitizePlanSeconds(raw && raw.tolerance_seconds);
+  // 只填计划秒数而未填容许偏差：容许偏差按 0 秒处理（须恰好准点）
+  if (typeof planned === 'number' && tolerance == null) tolerance = 0;
   return {
     label: String((raw && raw.label) != null ? raw.label : '').trim().slice(0, 50),
     type: CUE_TYPES.includes(raw && raw.type) ? raw.type : 'other',
@@ -61,6 +83,8 @@ function sanitizeCue(raw) {
     deps: [...new Set(deps.map((d) => String(d).trim()).filter(Boolean))].slice(0, 50),
     needs_review: raw && raw.needs_review ? 1 : 0,
     needs_prep: raw && raw.needs_prep ? 1 : 0,
+    planned_offset_seconds: planned,
+    tolerance_seconds: tolerance,
   };
 }
 
@@ -440,6 +464,116 @@ function markPrepInvalidated(commandId, reason, detail) {
   `).run(reason, detail || null, commandId);
 }
 
+/* ---- 提示计划节奏：计时起点（原演出启动时间）、分类与偏差 ---- */
+
+// 节奏分类（执行台 / 封场报告展示用）：
+//   early 提前 / on_time 准时 / late 逾时（触发时间相对计划±容差）；
+//   skipped 跳过（不计偏差）；pending 待执行 / overdue_pending 逾时待执行（未执行而超过计划上限）
+const PACE_CLASS_TEXT = {
+  early: '提前',
+  on_time: '准时',
+  late: '逾时',
+  skipped: '跳过',
+  pending: '待执行',
+  overdue_pending: '逾时待执行',
+};
+
+/**
+ * 演出的计时起点：沿接续链（continued_from_performance_id）回溯到最初（原）演出，
+ * 取其启动时间。接续演出沿用原演出计时起点；未接续的演出以自身启动时间为起点。
+ */
+function paceOrigin(perf) {
+  let cur = perf;
+  const seen = new Set([cur.id]);
+  while (cur.continued_from_performance_id) {
+    const prev = db.prepare('SELECT * FROM performances WHERE id = ?').get(cur.continued_from_performance_id);
+    if (!prev || seen.has(prev.id)) break;
+    seen.add(prev.id);
+    cur = prev;
+  }
+  return { performance_id: cur.id, started_at: cur.started_at };
+}
+
+/** 计划值是否为合法非负整数（非法值不参与节奏统计；发布校验已拦截，此处为防御） */
+function isValidPlanSeconds(v) {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 0;
+}
+
+/**
+ * 计算演出节奏：仅统计设置了计划（planned_offset_seconds 为合法非负整数）的提示，
+ * 旧版未设置计划的提示不参与节奏统计。以原演出启动时间为计时起点：
+ *  - 当前有效结果为已触发：偏差秒数 = 触发时间 − 计划时间；落在计划±容差内算准时，
+ *    早于下限为提前、晚于上限为逾时（承接触发沿用原操作时间，carried 流水保留原 created_at）；
+ *  - 已跳过：不计偏差；
+ *  - 无有效结果（待执行 / 受阻 / 已撤回）：超过计划上限（计划+容差）为逾时待执行，否则待执行；
+ *  撤回使原触发退出当前统计（无有效结果），重触发按新流水时间重算，历史流水仍可回看。
+ * @param {object} perf 演出
+ * @param {Array} cues 该演出锁定版本的提示（含计划列）
+ * @param {Map} latestByCue cue_id -> 最新事件（retracted 视为无有效结果）
+ * @param {number} nowMs 判定时刻（毫秒）
+ */
+function computePace(perf, cues, latestByCue, nowMs) {
+  const origin = paceOrigin(perf);
+  const originMs = Date.parse(origin.started_at);
+  const items = [];
+  const summary = { early: 0, on_time: 0, late: 0, skipped: 0, pending: 0, overdue_pending: 0 };
+  for (const c of cues) {
+    if (!isValidPlanSeconds(c.planned_offset_seconds)) continue; // 未设置计划不参与统计
+    const tolerance = isValidPlanSeconds(c.tolerance_seconds) ? c.tolerance_seconds : 0;
+    const plannedMs = originMs + c.planned_offset_seconds * 1000;
+    const winStartMs = plannedMs - tolerance * 1000;
+    const winEndMs = plannedMs + tolerance * 1000;
+    const e = latestByCue.get(c.id) || null;
+    const effective = e && e.action !== 'retracted' ? e.action : null;
+    let classification;
+    let deviation = null;
+    const extra = {};
+    if (effective === 'fired') {
+      const firedMs = Date.parse(e.created_at);
+      deviation = Math.round((firedMs - plannedMs) / 1000);
+      classification = firedMs < winStartMs ? 'early' : firedMs > winEndMs ? 'late' : 'on_time';
+    } else if (effective === 'skipped') {
+      classification = 'skipped'; // 跳过不计偏差
+    } else if (nowMs > winEndMs) {
+      classification = 'overdue_pending';
+      extra.overdue_seconds = Math.floor((nowMs - winEndMs) / 1000);
+    } else {
+      classification = 'pending';
+      extra.seconds_to_planned = Math.max(0, Math.round((plannedMs - nowMs) / 1000));
+    }
+    summary[classification] += 1;
+    items.push({
+      cue_id: c.id,
+      label: c.label,
+      seq: c.seq,
+      planned_offset_seconds: c.planned_offset_seconds,
+      tolerance_seconds: tolerance,
+      planned_at: new Date(plannedMs).toISOString(),
+      window_start: new Date(winStartMs).toISOString(),
+      window_end: new Date(winEndMs).toISOString(),
+      classification,
+      classification_text: PACE_CLASS_TEXT[classification],
+      deviation_seconds: deviation,
+      ...extra,
+      event: effective
+        ? { id: e.id, action: e.action, operator: e.operator, created_at: e.created_at, source: e.source }
+        : null,
+    });
+  }
+  return {
+    origin,
+    now: new Date(nowMs).toISOString(),
+    planned_count: items.length,
+    summary,
+    items,
+  };
+}
+
+/** 计划参数的可读描述（接续冲突说明用） */
+function planParamText(planned, tolerance) {
+  return planned == null ? '未设置计划' : `计划 ${planned} 秒、容许偏差 ${tolerance == null ? 0 : tolerance} 秒`;
+}
+
 /* ---------------- 路由表 ---------------- */
 
 const routes = [];
@@ -510,8 +644,8 @@ route('POST', '/api/shows/:id/versions', (body, p) => {
     const newId = Number(info.lastInsertRowid);
     if (base) {
       const cues = db.prepare('SELECT * FROM cues WHERE version_id = ? ORDER BY seq').all(base.id);
-      const ins = db.prepare('INSERT INTO cues (version_id, seq, label, type, description, deps, needs_review, needs_prep) VALUES (?,?,?,?,?,?,?,?)');
-      for (const c of cues) ins.run(newId, c.seq, c.label, c.type, c.description, c.deps, c.needs_review, c.needs_prep);
+      const ins = db.prepare('INSERT INTO cues (version_id, seq, label, type, description, deps, needs_review, needs_prep, planned_offset_seconds, tolerance_seconds) VALUES (?,?,?,?,?,?,?,?,?,?)');
+      for (const c of cues) ins.run(newId, c.seq, c.label, c.type, c.description, c.deps, c.needs_review, c.needs_prep, c.planned_offset_seconds, c.tolerance_seconds);
     }
     return { version: getVersion(newId), cues: getVersionCues(newId) };
   });
@@ -533,8 +667,8 @@ route('PUT', '/api/versions/:id/cues', (body, p) => {
   const cues = body.cues.map(sanitizeCue);
   withTx(() => {
     db.prepare('DELETE FROM cues WHERE version_id = ?').run(version.id);
-    const ins = db.prepare('INSERT INTO cues (version_id, seq, label, type, description, deps, needs_review, needs_prep) VALUES (?,?,?,?,?,?,?,?)');
-    cues.forEach((c, i) => ins.run(version.id, i + 1, c.label, c.type, c.description, JSON.stringify(c.deps), c.needs_review, c.needs_prep));
+    const ins = db.prepare('INSERT INTO cues (version_id, seq, label, type, description, deps, needs_review, needs_prep, planned_offset_seconds, tolerance_seconds) VALUES (?,?,?,?,?,?,?,?,?,?)');
+    cues.forEach((c, i) => ins.run(version.id, i + 1, c.label, c.type, c.description, JSON.stringify(c.deps), c.needs_review, c.needs_prep, c.planned_offset_seconds, c.tolerance_seconds));
   });
   // 草稿允许暂存不完整内容，同时返回校验结果供界面提示
   return { ok: true, errors: validateCues(cues), cues: getVersionCues(version.id) };
@@ -705,6 +839,13 @@ route('GET', '/api/performances/:id', (body, p) => {
   }
   for (const c of cueStates) c.prep_command = activePrepByCue.get(c.id) || null;
 
+  // 提示计划节奏：以原演出启动时间为计时起点，按当前有效结果对有计划的提示分类
+  // （提前 / 准时 / 逾时 / 跳过 / 待执行 / 逾时待执行）并给出偏差秒数；
+  // 未设置计划的提示 pace 为 null，不参与节奏统计。
+  const pace = computePace(perf, cues, eventByCue, Date.now());
+  const paceByCue = new Map(pace.items.map((it) => [it.cue_id, it]));
+  for (const c of cueStates) c.pace = paceByCue.get(c.id) || null;
+
   // 现场换班交接：当前待签收交接单（附按最新状态实时计算的差异）与全部交接历史
   // （已签收为不可变历史；被重提替换 / 接续作废旧单同样留痕）
   const pendingHandover = pendingHandoverRow(perf.id);
@@ -730,6 +871,21 @@ route('GET', '/api/performances/:id', (body, p) => {
     handover,
     handover_history,
     closing,
+    pace,
+  };
+});
+
+/* ---- 提示计划节奏（只读）：计时起点、各计划提示分类与偏差、汇总 ---- */
+
+route('GET', '/api/performances/:id/pace', (body, p) => {
+  const perf = db.prepare('SELECT * FROM performances WHERE id = ?').get(p.id);
+  if (!perf) throw new HttpError(404, '演出不存在');
+  const cues = getVersionCues(perf.version_id);
+  // 撤回（retracted）视为无有效结果：原触发退出当前统计；历史流水在 GET /api/performances/:id 回看
+  const pace = computePace(perf, cues, latestEventsByCue(perf.id), Date.now());
+  return {
+    performance: { id: perf.id, name: perf.name, status: perf.status, version_id: perf.version_id },
+    ...pace,
   };
 });
 
@@ -1500,6 +1656,19 @@ function buildContinuationPlan(perf, target) {
     }
     if (Boolean(tc.needs_review) !== Boolean(cur.needs_review)) {
       addConflict(label, `复核标记不一致：v${target.version_number} 为${tc.needs_review ? '需复核' : '无需复核'}，当前为${cur.needs_review ? '需复核' : '无需复核'}`);
+    }
+    // 已留痕编号的计划参数（计划秒数 / 容许偏差）不得改变：节奏统计以原演出启动时间为
+    // 计时起点并沿用各版本锁定计划，改变已留痕编号的计划会使历史偏差口径不一致
+    const curPlanned = cur.planned_offset_seconds == null ? null : cur.planned_offset_seconds;
+    const tcPlanned = tc.planned_offset_seconds == null ? null : tc.planned_offset_seconds;
+    const curTol = curPlanned == null ? null : (cur.tolerance_seconds == null ? 0 : cur.tolerance_seconds);
+    const tcTol = tcPlanned == null ? null : (tc.tolerance_seconds == null ? 0 : tc.tolerance_seconds);
+    if (curPlanned !== tcPlanned || curTol !== tcTol) {
+      addConflict(
+        label,
+        `计划参数不一致：v${target.version_number} 为${planParamText(tcPlanned, tcTol)}，` +
+        `当前为${planParamText(curPlanned, curTol)}（已留痕编号的计划秒数与容许偏差不得改变）`
+      );
     }
   }
 
@@ -2920,6 +3089,12 @@ function buildClosingReport(perf, closedBy, note, closedAt) {
   `).all(perf.id);
   const latestByCue = latestEventsByCue(perf.id);
 
+  // 提示计划节奏：封场时一次性固定最终分类与汇总（此时每条提示均有有效结果，
+  // 分类只会是 提前 / 准时 / 逾时 / 跳过）；计时起点为原演出启动时间，
+  // 承接触发沿用原操作时间。报告固定后不随草稿或后续版本变化。
+  const pace = computePace(perf, cues, latestByCue, Date.parse(closedAt));
+  const paceByCue = new Map(pace.items.map((it) => [it.cue_id, it]));
+
   let manualCount = 0;
   let carriedCount = 0;
   let firedCount = 0;
@@ -2934,6 +3109,7 @@ function buildClosingReport(perf, closedBy, note, closedAt) {
     if (effective === 'fired') firedCount += 1;
     if (effective === 'skipped') skippedCount += 1;
     const traced = e ? traceEventOrigin(e, versionNumberByPerfId) : null;
+    const cuePace = paceByCue.get(c.id) || null;
     return {
       cue_id: c.id,
       label: c.label,
@@ -2943,6 +3119,8 @@ function buildClosingReport(perf, closedBy, note, closedAt) {
       deps: c.deps,
       needs_review: !!c.needs_review,
       needs_prep: !!c.needs_prep,
+      planned_offset_seconds: c.planned_offset_seconds == null ? null : c.planned_offset_seconds,
+      tolerance_seconds: c.planned_offset_seconds == null ? null : (c.tolerance_seconds == null ? 0 : c.tolerance_seconds),
       final_status: effective, // fired / skipped / null（封场核对保证非 null）
       event_id: e ? e.id : null,
       operator: e ? e.operator : null,
@@ -2953,6 +3131,17 @@ function buildClosingReport(perf, closedBy, note, closedAt) {
       carried_from_event_id: e && e.source === 'carried' ? (e.carried_from_event_id || null) : null,
       origin: traced ? traced.origin : null,
       origin_hops: traced ? traced.hops : null,
+      // 该提示的最终节奏分类（未设置计划的提示为 null，不参与节奏统计）
+      pace: cuePace
+        ? {
+            classification: cuePace.classification,
+            classification_text: cuePace.classification_text,
+            deviation_seconds: cuePace.deviation_seconds,
+            planned_at: cuePace.planned_at,
+            window_start: cuePace.window_start,
+            window_end: cuePace.window_end,
+          }
+        : null,
     };
   });
 
@@ -3029,6 +3218,13 @@ function buildClosingReport(perf, closedBy, note, closedAt) {
     handovers,
     prep_commands,
     prep_counts: prepCounts,
+    // 节奏统计：计时起点（原演出启动时间）、各计划提示最终分类与偏差、分类汇总
+    pace: {
+      origin: pace.origin,
+      planned_count: pace.planned_count,
+      summary: pace.summary,
+      items: pace.items,
+    },
     events: events.map((e) => ({
       id: e.id, label: e.label, seq: e.seq, action: e.action, operator: e.operator,
       reason: e.reason || null, created_at: e.created_at, source: e.source,
